@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ATACread"
+version = "0.1.0"
+description = "A Python package for ATAC-seq and RNA-seq bigWig reading, gene-region reporting, visualization, and raw-signal tests."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "KDbio" }
+]
+license = { text = "MIT" }
+keywords = ["ATAC-seq", "RNA-seq", "bigWig", "bioinformatics", "genomics"]
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+bigwig = ["pyBigWig"]
+bam = ["pysam", "pyBigWig"]
+deseq2 = ["pydeseq2"]
+all = ["pyBigWig", "pysam", "pydeseq2"]
+
+[project.urls]
+Homepage = "https://github.com/KDbio/ATACread"
+Repository = "https://github.com/KDbio/ATACread"
+
+[project.scripts]
+atacread = "atacread.cli:main"
+atacrna = "atacread.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["atacread*"]
+
