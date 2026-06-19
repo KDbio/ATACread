@@ -86,33 +86,72 @@ def run_catalog(gtf_file, fasta_file, atac_files=None, rna_files=None,
                 classify_state=True):
     """
     全基因特征表 + 可选基因状态分类。
+
+    catalog 面向全 GTF，不能像 profile 那样把每个基因的 per-base 信号数组
+    全部攒在内存里。这里按基因流式读取 bigWig，立刻汇总成标量统计值，
+    只保留最终 CSV 需要的 mean / median / peak / auc 等结果。
     """
+    from .read import ATACReader, RNAReader
+
     os.makedirs(output_dir, exist_ok=True)
-    features, atac_names, rna_names = _build_features(
-        gtf_file, fasta_file, atac_files, rna_files,
+
+    gene_df = resolve_genes(
+        gtf_file,
+        genes=None,
+        gene_file=None,
         promoter_upstream=promoter_upstream,
         promoter_downstream=promoter_downstream,
-        atac_names=atac_names, rna_names=rna_names,
     )
+    if gene_df.empty:
+        raise ValueError("没有找到可分析的基因")
+
+    atac = ATACReader(atac_files, sample_names=atac_names) if atac_files else None
+    rna = RNAReader(rna_files, sample_names=rna_names) if rna_files else None
+    atac_names = atac.sample_names if atac else []
+    rna_names = rna.sample_names if rna else []
     
     base_cols = ["gene_id", "gene_name", "gene_type", "chrom", "strand",
                  "start", "end", "length", "tss", "promoter_start", "promoter_end"]
     
     rows = []
-    for _, r in features.iterrows():
-        row = {c: r.get(c) for c in base_cols}
-        for s in atac_names:
-            for region in ("promoter", "gene_body"):
-                key = f"atac_{s}_{region}_signal"
-                if key in r:
-                    for k, v in summarize(r[key]).items():
-                        row[f"atac_{s}_{region}_{k}"] = v
-        for s in rna_names:
-            key = f"rna_{s}_gene_body_signal"
-            if key in r:
-                for k, v in summarize(r[key]).items():
-                    row[f"rna_{s}_gene_body_{k}"] = v
-        rows.append(row)
+    try:
+        if atac is not None:
+            atac._open()
+        if rna is not None:
+            rna._open()
+
+        total = len(gene_df)
+        print(f"[catalog] 流式读取 {total} 个基因；不保存 per-base 数组，避免内存爆掉。")
+
+        for i, (_, r) in enumerate(gene_df.iterrows(), start=1):
+            gene_info = r.to_dict()
+            row = {c: gene_info.get(c) for c in base_cols}
+
+            if atac is not None:
+                atac_signals = atac.fetch_gene(gene_info)
+                for s in atac_names:
+                    for region in ("promoter", "gene_body"):
+                        key = f"atac_{s}_{region}_signal"
+                        if key in atac_signals:
+                            for k, v in summarize(atac_signals[key]).items():
+                                row[f"atac_{s}_{region}_{k}"] = v
+
+            if rna is not None:
+                rna_signals = rna.fetch_gene(gene_info)
+                for s in rna_names:
+                    key = f"rna_{s}_gene_body_signal"
+                    if key in rna_signals:
+                        for k, v in summarize(rna_signals[key]).items():
+                            row[f"rna_{s}_gene_body_{k}"] = v
+
+            rows.append(row)
+            if i % 5000 == 0 or i == total:
+                print(f"[catalog] 已处理 {i}/{total} 个基因")
+    finally:
+        if atac is not None:
+            atac.close()
+        if rna is not None:
+            rna.close()
     
     df = pd.DataFrame(rows)
     
