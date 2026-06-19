@@ -430,7 +430,7 @@ def plot_pca_2d(matrix_df, output_png, title="PCA"):
 
 def resolve_genes(gtf_file, genes=None, gene_file=None,
                   promoter_upstream=200, promoter_downstream=200):
-    from read import GTFFullReader, GTFQueryReader
+    from .read import GTFFullReader, GTFQueryReader
     
     items = []
     if gene_file:
