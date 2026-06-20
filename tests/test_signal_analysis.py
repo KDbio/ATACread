@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -10,7 +11,14 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     pyBigWig = None
 
-from atacread.read import RNAReader, attach_exon_intervals, GTFAnnotationCache
+from atacread.read import (
+    RNAReader,
+    attach_exon_intervals,
+    GTFAnnotationCache,
+    FastaIndex,
+    fasta_read,
+    configure_rna_regions,
+)
 from atacread.signal_utils import (
     binned_permutation_test,
     _comparison_items,
@@ -19,6 +27,7 @@ from atacread.signal_utils import (
     plot_gene_signals,
 )
 from atacread.cli import main as cli_main
+from atacread.multiomics import run_paired
 
 
 class SignalStatisticsTest(unittest.TestCase):
@@ -111,6 +120,10 @@ class GTFCacheTest(unittest.TestCase):
                 'gene_id "GENE1.1"; transcript_id "TX1"; gene_name "GENE1";\n'
                 "chr1\ttest\texon\t201\t250\t.\t+\t.\t"
                 'gene_id "GENE1.1"; transcript_id "TX1"; gene_name "GENE1";\n'
+                "chr1\ttest\texon\t101\t120\t.\t+\t.\t"
+                'gene_id "GENE1.1"; transcript_id "TXALT.2"; gene_name "GENE1";\n'
+                "chr1\ttest\texon\t221\t250\t.\t+\t.\t"
+                'gene_id "GENE1.1"; transcript_id "TXALT.2"; gene_name "GENE1";\n'
                 "chr2\ttest\tgene\t501\t700\t.\t-\t.\t"
                 'gene_id "GENE2.1"; gene_name "GENE2"; gene_type "lncRNA";\n'
                 "chr2\ttest\texon\t601\t700\t.\t-\t.\t"
@@ -137,8 +150,88 @@ class GTFCacheTest(unittest.TestCase):
             self.assertEqual(int(second.iloc[0]["promoter_start"]), 20)
             self.assertEqual(len(cache.read(indices=[1])), 1)
 
+            union = configure_rna_regions(first, mode="exon_union")
+            transcript = configure_rna_regions(
+                first,
+                mode="transcript",
+                transcript_ids=["TXALT"],
+            )
+            self.assertEqual(int(union.iloc[0]["rna_length"]), 100)
+            self.assertEqual(int(transcript.iloc[0]["rna_length"]), 50)
+            self.assertEqual(transcript.iloc[0]["rna_transcript_id"], "TXALT.2")
+
             cli_main(["gtf-index", "--gtf", str(gtf)])
             self.assertTrue(Path(str(gtf) + ".atacread.sqlite").exists())
+
+
+class FastaIndexTest(unittest.TestCase):
+    def test_fai_build_and_targeted_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            fasta = tmp / "genome.fa"
+            fasta.write_bytes(
+                b">chr1 description\nACGT\nACGT\nAC\n"
+                b">chr2\nTTTT\nGGGG\n"
+            )
+            index = FastaIndex(fasta)
+            index.build()
+            first_mtime = Path(index.index_file).stat().st_mtime_ns
+
+            result = fasta_read(fasta, keep_chroms=["chr2"], use_cache=False)
+            self.assertEqual(set(result), {"chr2"})
+            self.assertEqual(result["chr2"]["+"], "TTTTGGGG")
+            self.assertEqual(index.fetch_chromosome("chr1"), "ACGTACGTAC")
+
+            index.build()
+            self.assertEqual(first_mtime, Path(index.index_file).stat().st_mtime_ns)
+            cli_main(["fasta-index", "--fasta", str(fasta)])
+
+
+class PairedReuseTest(unittest.TestCase):
+    def test_paired_builds_features_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            metadata = tmp / "metadata.csv"
+            metadata.write_text(
+                "sample,assay,group\n"
+                "A1,ATAC,control\nA2,ATAC,treat\n"
+                "R1,RNA,control\nR2,RNA,treat\n",
+                encoding="utf-8",
+            )
+            features = pd.DataFrame([{
+                "gene_id": "GENE1.1",
+                "gene_name": "GENE1",
+                "chrom": "chr1",
+                "strand": "+",
+                "promoter_seq": "A" * 20,
+                "atac_A1_promoter_signal": np.ones(40),
+                "atac_A2_promoter_signal": np.full(40, 2.0),
+                "atac_A1_gene_body_signal": np.ones(40),
+                "atac_A2_gene_body_signal": np.full(40, 2.0),
+                "rna_R1_gene_body_signal": np.ones(40),
+                "rna_R2_gene_body_signal": np.full(40, 2.0),
+            }])
+            bundle = (features, ["A1", "A2"], ["R1", "R2"])
+
+            with mock.patch(
+                "atacread.multiomics._build_features",
+                return_value=bundle,
+            ) as build_features, mock.patch(
+                "atacread.multiomics.plot_gene_signals"
+            ):
+                run_paired(
+                    "genes.gtf",
+                    "genome.fa",
+                    ["a1.bw", "a2.bw"],
+                    ["r1.bw", "r2.bw"],
+                    metadata,
+                    genes=["GENE1"],
+                    output_dir=tmp / "out",
+                    atac_names=["A1", "A2"],
+                    rna_names=["R1", "R2"],
+                    n_permutations=20,
+                )
+            self.assertEqual(build_features.call_count, 1)
 
 
 @unittest.skipUnless(pyBigWig is not None, "requires pyBigWig")
@@ -184,6 +277,12 @@ class RNAExonReaderTest(unittest.TestCase):
             self.assertEqual(len(signal), 20)
             self.assertTrue(np.allclose(signal, 2.0))
             self.assertEqual(int(genes.iloc[0]["exon_length"]), 20)
+
+            gene["rna_intervals"] = [(0, 10)]
+            with RNAReader([bw_path], sample_names=["RNA1"]) as reader:
+                transcript_signal = reader.fetch_gene(gene)["rna_RNA1_gene_body_signal"]
+            self.assertEqual(len(transcript_signal), 10)
+            self.assertTrue(np.allclose(transcript_signal, 2.0))
 
 
 if __name__ == "__main__":

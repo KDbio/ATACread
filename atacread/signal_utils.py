@@ -552,7 +552,7 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
         (ax_atac_body, atac_genebody_raw, "Gene body ATAC (raw)", "raw ATAC"),
     ]
     if has_rna:
-        panels.append((ax_rna_body, rna_raw, "RNA merged exons (raw)", "raw RNA"))
+        panels.append((ax_rna_body, rna_raw, "RNA selected exons (raw)", "raw RNA"))
     
     for ax, data, title, ylabel in panels:
         if data:
@@ -570,7 +570,7 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
     
     ax_atac_body.set_xlabel("Position in gene body (bp)")
     if ax_rna_body is not None:
-        ax_rna_body.set_xlabel("Position in merged exons (bp)")
+        ax_rna_body.set_xlabel("Position in selected exons (bp)")
 
     _add_panel_statistics(
         ax_promoter,

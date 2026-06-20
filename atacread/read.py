@@ -54,6 +54,7 @@ class GTFReader:
     # 用正则匹配 key "value" 这种模式
     ATTR_PATTERN = re.compile(r'(\S+)\s+"([^"]+)"')
     GENE_ID_PATTERN = re.compile(r'(?:^|;)\s*gene_id\s+"([^"]+)"')
+    TRANSCRIPT_ID_PATTERN = re.compile(r'(?:^|;)\s*transcript_id\s+"([^"]+)"')
 
     def __init__(
         self,
@@ -440,7 +441,7 @@ def query_genes_with_exons(gtf_file, queries, promoter_upstream=200,
 class GTFAnnotationCache:
     """Persistent SQLite index for gene records and merged exon intervals."""
 
-    SCHEMA_VERSION = "1"
+    SCHEMA_VERSION = "2"
 
     def __init__(self, gtf_file, cache_file=None):
         self.gtf_file = os.path.abspath(os.fspath(gtf_file))
@@ -510,19 +511,24 @@ class GTFAnnotationCache:
         conn = sqlite3.connect(tmp_file)
         current_record = None
         exon_intervals = []
+        transcript_intervals = {}
         gene_index = 0
 
         def finish_gene():
-            nonlocal current_record, exon_intervals, gene_index
+            nonlocal current_record, exon_intervals, transcript_intervals, gene_index
             if current_record is None:
                 return
             merged = _merge_intervals(exon_intervals)
+            merged_transcripts = {
+                transcript_id: _merge_intervals(intervals)
+                for transcript_id, intervals in transcript_intervals.items()
+            }
             exon_length = int(sum(end - start for start, end in merged))
             conn.execute(
                 """INSERT INTO genes
                    (gene_index, gene_id, gene_id_base, gene_name,
-                    record_json, exon_json, exon_length)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    record_json, exon_json, transcript_json, exon_length)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     gene_index,
                     current_record["gene_id"],
@@ -530,6 +536,7 @@ class GTFAnnotationCache:
                     current_record["gene_name"],
                     json.dumps(current_record, ensure_ascii=False),
                     json.dumps(merged),
+                    json.dumps(merged_transcripts),
                     exon_length,
                 ),
             )
@@ -539,6 +546,7 @@ class GTFAnnotationCache:
                 print(f"[gtf-cache] 已索引 {gene_index} 个基因")
             current_record = None
             exon_intervals = []
+            transcript_intervals = {}
 
         try:
             conn.executescript(
@@ -551,6 +559,7 @@ class GTFAnnotationCache:
                     gene_name TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     exon_json TEXT NOT NULL,
+                    transcript_json TEXT NOT NULL,
                     exon_length INTEGER NOT NULL
                 );
                 """
@@ -569,7 +578,13 @@ class GTFAnnotationCache:
                         match = GTFReader.GENE_ID_PATTERN.search(cols[8])
                         exon_gene = match.group(1).split(".")[0] if match else ""
                         if exon_gene == current_record["gene_id_base"]:
-                            exon_intervals.append((int(cols[3]) - 1, int(cols[4])))
+                            interval = (int(cols[3]) - 1, int(cols[4]))
+                            exon_intervals.append(interval)
+                            transcript_match = GTFReader.TRANSCRIPT_ID_PATTERN.search(cols[8])
+                            if transcript_match:
+                                transcript_intervals.setdefault(
+                                    transcript_match.group(1), []
+                                ).append(interval)
             finish_gene()
             conn.executemany(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
@@ -598,8 +613,12 @@ class GTFAnnotationCache:
     def _deserialize(self, row, upstream, downstream, query=None):
         record = json.loads(row[0])
         record["exon_intervals"] = [tuple(interval) for interval in json.loads(row[1])]
-        record["exon_length"] = int(row[2])
-        record["gene_index"] = int(row[3])
+        record["transcript_intervals"] = {
+            transcript_id: [tuple(interval) for interval in intervals]
+            for transcript_id, intervals in json.loads(row[2]).items()
+        }
+        record["exon_length"] = int(row[3])
+        record["gene_index"] = int(row[4])
         if query is not None:
             record["query"] = query
         return self._record_with_promoter(record, upstream, downstream)
@@ -614,7 +633,8 @@ class GTFAnnotationCache:
                     query = str(query).strip()
                     query_base = query.split(".")[0]
                     rows = conn.execute(
-                        """SELECT record_json, exon_json, exon_length, gene_index
+                        """SELECT record_json, exon_json, transcript_json,
+                                  exon_length, gene_index
                            FROM genes
                            WHERE gene_name = ? OR gene_id = ? OR gene_id_base = ?
                            ORDER BY gene_index""",
@@ -629,7 +649,8 @@ class GTFAnnotationCache:
             elif indices:
                 for index in indices:
                     row = conn.execute(
-                        """SELECT record_json, exon_json, exon_length, gene_index
+                        """SELECT record_json, exon_json, transcript_json,
+                                  exon_length, gene_index
                            FROM genes WHERE gene_index = ?""",
                         (int(index),),
                     ).fetchone()
@@ -639,7 +660,8 @@ class GTFAnnotationCache:
                         ))
             else:
                 rows = conn.execute(
-                    """SELECT record_json, exon_json, exon_length, gene_index
+                    """SELECT record_json, exon_json, transcript_json,
+                              exon_length, gene_index
                        FROM genes ORDER BY gene_index"""
                 )
                 records.extend(
@@ -647,6 +669,79 @@ class GTFAnnotationCache:
                     for row in rows
                 )
         return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+def configure_rna_regions(gene_df, mode="exon_union", transcript_ids=None):
+    """Choose merged gene exons or one explicitly requested transcript."""
+    mode = str(mode).lower().replace("-", "_")
+    if mode not in {"exon_union", "transcript"}:
+        raise ValueError("rna_region_mode 必须是 exon_union 或 transcript")
+    if gene_df is None or gene_df.empty:
+        return gene_df
+
+    out = gene_df.copy()
+    if mode == "exon_union":
+        intervals = [list(value or []) for value in out["exon_intervals"]]
+        out["rna_intervals"] = intervals
+        out["rna_region"] = "exon_union"
+        out["rna_transcript_id"] = None
+        out["rna_length"] = [
+            int(sum(end - start for start, end in value)) for value in intervals
+        ]
+        return out
+
+    if isinstance(transcript_ids, str):
+        transcript_ids = [
+            value.strip() for value in transcript_ids.split(",") if value.strip()
+        ]
+    requested = {str(value).strip() for value in (transcript_ids or []) if str(value).strip()}
+    requested_base = {value.split(".")[0] for value in requested}
+    if not requested:
+        raise ValueError("transcript 模式必须通过 --transcripts 指定 transcript_id")
+
+    selected_intervals = []
+    selected_ids = []
+    missing = []
+    ambiguous = []
+    for _, row in out.iterrows():
+        transcript_map = row.get("transcript_intervals")
+        transcript_map = transcript_map if isinstance(transcript_map, dict) else {}
+        exact_matches = [
+            transcript_id for transcript_id in transcript_map
+            if transcript_id in requested
+        ]
+        matches = exact_matches or [
+            transcript_id for transcript_id in transcript_map
+            if transcript_id.split(".")[0] in requested_base
+        ]
+        if not matches:
+            missing.append(str(row.get("gene_name", row.get("gene_id", "unknown"))))
+            selected_intervals.append([])
+            selected_ids.append(None)
+            continue
+        if len(matches) > 1:
+            ambiguous.append(
+                f"{row.get('gene_name', row.get('gene_id', 'unknown'))}: {matches}"
+            )
+            selected_intervals.append([])
+            selected_ids.append(None)
+            continue
+        transcript_id = matches[0]
+        selected_ids.append(transcript_id)
+        selected_intervals.append(list(transcript_map[transcript_id]))
+
+    if missing:
+        raise ValueError("以下基因没有匹配到指定转录本: " + ", ".join(missing))
+    if ambiguous:
+        raise ValueError("每个基因只能指定一个转录本: " + "; ".join(ambiguous))
+
+    out["rna_intervals"] = selected_intervals
+    out["rna_region"] = "transcript"
+    out["rna_transcript_id"] = selected_ids
+    out["rna_length"] = [
+        int(sum(end - start for start, end in value)) for value in selected_intervals
+    ]
+    return out
 
 
 # ============================================================
@@ -671,6 +766,139 @@ def reverse_complement(seq):
 _FASTA_CACHE = {}
 
 
+class FastaIndex:
+    """Build and use a standard five-column FASTA ``.fai`` index."""
+
+    def __init__(self, fasta_file, index_file=None):
+        self.fasta_file = os.path.abspath(os.fspath(fasta_file))
+        self.index_file = os.path.abspath(
+            os.fspath(index_file) if index_file else self.fasta_file + ".fai"
+        )
+
+    def is_valid(self):
+        if not os.path.exists(self.index_file):
+            return False
+        try:
+            if os.stat(self.index_file).st_mtime_ns < os.stat(self.fasta_file).st_mtime_ns:
+                return False
+            return bool(self.read_entries())
+        except (OSError, ValueError):
+            return False
+
+    def build(self, force=False):
+        if not force and self.is_valid():
+            return self.index_file
+        if self.fasta_file.lower().endswith(".gz"):
+            raise ValueError("当前内置 FAI 索引只支持未压缩 FASTA")
+
+        os.makedirs(os.path.dirname(self.index_file) or ".", exist_ok=True)
+        tmp_file = f"{self.index_file}.tmp-{os.getpid()}"
+        entries = []
+        current = None
+
+        def finish_current():
+            if current is not None:
+                entries.append((
+                    current["name"],
+                    current["length"],
+                    current["offset"],
+                    current["line_bases"],
+                    current["line_width"],
+                ))
+
+        print(f"[fasta-index] 创建索引: {self.index_file}")
+        with open(self.fasta_file, "rb") as fasta:
+            while True:
+                line = fasta.readline()
+                if not line:
+                    break
+                if line.startswith(b">"):
+                    finish_current()
+                    name = line[1:].split(None, 1)[0].decode("utf-8")
+                    current = {
+                        "name": name,
+                        "length": 0,
+                        "offset": fasta.tell(),
+                        "line_bases": 0,
+                        "line_width": 0,
+                        "last_full_bases": None,
+                    }
+                    continue
+                if current is None:
+                    continue
+                sequence_line = line.rstrip(b"\r\n")
+                if not sequence_line:
+                    continue
+                bases = len(sequence_line)
+                width = len(line)
+                if current["line_bases"] == 0:
+                    current["line_bases"] = bases
+                    current["line_width"] = width
+                elif current["last_full_bases"] is not None:
+                    raise ValueError(
+                        f"FASTA {current['name']} has sequence lines after a short final line"
+                    )
+                elif bases != current["line_bases"]:
+                    if bases > current["line_bases"]:
+                        raise ValueError(
+                            f"FASTA {current['name']} has inconsistent line lengths"
+                        )
+                    current["last_full_bases"] = bases
+                current["length"] += bases
+        finish_current()
+
+        try:
+            with open(tmp_file, "wt", encoding="utf-8", newline="\n") as out:
+                for entry in entries:
+                    out.write("\t".join(str(value) for value in entry) + "\n")
+            os.replace(tmp_file, self.index_file)
+        finally:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        print(f"[fasta-index] 完成: {len(entries)} 条序列")
+        return self.index_file
+
+    def read_entries(self):
+        entries = {}
+        with open(self.index_file, "rt", encoding="utf-8") as index:
+            for line in index:
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 5:
+                    raise ValueError(f"无效 FAI 行: {line.rstrip()}")
+                entries[cols[0]] = {
+                    "length": int(cols[1]),
+                    "offset": int(cols[2]),
+                    "line_bases": int(cols[3]),
+                    "line_width": int(cols[4]),
+                }
+        return entries
+
+    def fetch_chromosome(self, chrom):
+        self.build()
+        entries = self.read_entries()
+        if chrom not in entries:
+            raise KeyError(chrom)
+        entry = entries[chrom]
+        length = entry["length"]
+        line_bases = entry["line_bases"]
+        line_width = entry["line_width"]
+        if length == 0:
+            return ""
+        full_lines, remainder = divmod(length, line_bases)
+        byte_count = full_lines * line_width
+        if remainder == 0:
+            byte_count -= line_width - line_bases
+        else:
+            byte_count += remainder
+        with open(self.fasta_file, "rb") as fasta:
+            fasta.seek(entry["offset"])
+            raw = fasta.read(byte_count)
+        sequence = raw.replace(b"\n", b"").replace(b"\r", b"")[:length]
+        if len(sequence) != length:
+            raise ValueError(f"FAI 无法完整读取 {chrom}: {len(sequence)}/{length}")
+        return sequence.decode("ascii").upper()
+
+
 def fasta_read(file, keep_chroms=None, store_reverse=False, use_cache=True):
     """
     读取一个 fasta 中的所有染色体的序列数据并分别储存。
@@ -686,32 +914,26 @@ def fasta_read(file, keep_chroms=None, store_reverse=False, use_cache=True):
         同一进程内缓存读取结果，避免重复加载同一个 FASTA。
     """
     keep_chroms = None if keep_chroms is None else frozenset(str(c) for c in keep_chroms)
-    cache_key = (os.path.abspath(file), keep_chroms, bool(store_reverse))
+    source_stat = os.stat(file)
+    cache_key = (
+        os.path.abspath(file),
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+        keep_chroms,
+        bool(store_reverse),
+    )
     if use_cache and cache_key in _FASTA_CACHE:
         return _FASTA_CACHE[cache_key]
 
-    sequences = {}
-    midchr = None
-    keep_current = False
-
-    with open(file, "rt", encoding="utf-8") as fasta:
-        for line in fasta:
-            if not line.strip():
-                continue
-
-            if line.startswith(">"):
-                midchr = line[1:].split()[0]
-                keep_current = keep_chroms is None or midchr in keep_chroms
-                if keep_current and midchr not in sequences:
-                    sequences[midchr] = []
-                continue
-
-            if keep_current and midchr is not None:
-                sequences[midchr].append(line.strip().upper())
-
+    index = FastaIndex(file)
+    index.build()
+    available = index.read_entries()
+    selected = list(available) if keep_chroms is None else [
+        chrom for chrom in keep_chroms if chrom in available
+    ]
     final = {}
-    for chrom, seq_list in sequences.items():
-        plus_seq = "".join(seq_list)
+    for chrom in selected:
+        plus_seq = index.fetch_chromosome(chrom)
         final[chrom] = {"+": plus_seq}
         if store_reverse:
             final[chrom]["-"] = reverse_complement(plus_seq)
@@ -1142,7 +1364,7 @@ class RNAReader(BigWigReader):
         Falling back to the whole gene body keeps compatibility with custom
         gene records that do not contain ``exon_intervals``.
         """
-        intervals = gene_info.get("exon_intervals")
+        intervals = gene_info.get("rna_intervals", gene_info.get("exon_intervals"))
         if not isinstance(intervals, (list, tuple)) or not intervals:
             return super().fetch_gene(gene_info)
 
@@ -1287,7 +1509,12 @@ def assemble_gene_features(
             "end": gene_info["end"],
             "length": gene_info.get("length", gene_info["end"] - gene_info["start"]),
             "exon_length": gene_info.get("exon_length"),
-            "rna_region": "merged_exons" if gene_info.get("exon_intervals") else "gene_body",
+            "rna_region": gene_info.get(
+                "rna_region",
+                "exon_union" if gene_info.get("exon_intervals") else "gene_body",
+            ),
+            "rna_transcript_id": gene_info.get("rna_transcript_id"),
+            "rna_length": gene_info.get("rna_length", gene_info.get("exon_length")),
             "tss": gene_info.get("tss"),
             "promoter_start": gene_info.get("promoter_start"),
             "promoter_end": gene_info.get("promoter_end"),

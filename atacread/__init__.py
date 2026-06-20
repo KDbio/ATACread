@@ -16,6 +16,7 @@ from .bam_tools import (
     pydeseq2_differential,
     run_bam_downstream,
 )
+from .read import FastaIndex, GTFAnnotationCache
 
 __all__ = [
     "extract_multiomics_features",
@@ -30,4 +31,6 @@ __all__ = [
     "bam_to_bigwig",
     "pydeseq2_differential",
     "run_bam_downstream",
+    "FastaIndex",
+    "GTFAnnotationCache",
 ]

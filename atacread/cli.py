@@ -57,7 +57,10 @@ def main(argv=None):
     )
     parser.add_argument(
         "mode",
-        choices=["catalog", "profile", "paired", "bam", "deseq2", "gtf-index"],
+        choices=[
+            "catalog", "profile", "paired", "bam", "deseq2",
+            "gtf-index", "fasta-index",
+        ],
     )
     parser.add_argument("-w", "--work-dir", default=".", help="Folder used for automatic file discovery.")
     parser.add_argument("-o", "--output-dir", default=None, help="Output folder.")
@@ -70,6 +73,17 @@ def main(argv=None):
     parser.add_argument("--rna", default=None, help="Comma-separated RNA bigWig files.")
     parser.add_argument("--atac-names", default=None, help="Comma-separated ATAC sample names.")
     parser.add_argument("--rna-names", default=None, help="Comma-separated RNA sample names.")
+    parser.add_argument(
+        "--rna-region-mode",
+        choices=["exon_union", "transcript"],
+        default="exon_union",
+        help="RNA region: merged gene exons or explicitly selected transcripts.",
+    )
+    parser.add_argument(
+        "--transcripts",
+        default=None,
+        help="Comma-separated transcript IDs used with --rna-region-mode transcript.",
+    )
     parser.add_argument("--promoter-upstream", type=int, default=200, help="Promoter upstream length.")
     parser.add_argument("--promoter-downstream", type=int, default=200, help="Promoter downstream length.")
     parser.add_argument("--bin-size", default="auto", help="Permutation-test bin size: auto or an integer.")
@@ -82,6 +96,8 @@ def main(argv=None):
     parser.add_argument("--no-classify", action="store_true", help="Do not classify gene states in catalog mode.")
     parser.add_argument("--rebuild-gtf-cache", action="store_true",
                         help="Force rebuilding the GTF SQLite index.")
+    parser.add_argument("--rebuild-fasta-index", action="store_true",
+                        help="Force rebuilding the FASTA .fai index.")
 
     parser.add_argument("--bam", default=None, help="Comma-separated BAM files for BAM mode.")
     parser.add_argument("--regions", default=None, help="BED regions for BAM counting.")
@@ -105,6 +121,20 @@ def main(argv=None):
     genes = _split_csv(args.genes)
     atac_names = _split_csv(args.atac_names)
     rna_names = _split_csv(args.rna_names)
+    transcript_ids = _split_csv(args.transcripts)
+
+    if args.mode == "fasta-index":
+        from .read import FastaIndex
+
+        fasta = args.fasta
+        if not fasta:
+            candidates = auto_find(args.work_dir, [".fa", ".fasta", ".fna"])
+            fasta = candidates[0] if candidates else None
+        if not fasta:
+            raise ValueError("fasta-index mode requires --fasta or a FASTA in --work-dir")
+        index = FastaIndex(fasta)
+        print(index.build(force=args.rebuild_fasta_index))
+        return
 
     if args.mode == "gtf-index":
         from .read import GTFAnnotationCache
@@ -182,6 +212,8 @@ def main(argv=None):
             n_permutations=args.n_permutations,
             significance_level=args.significance_level,
             lfc_threshold=args.lfc_threshold,
+            rna_region_mode=args.rna_region_mode,
+            transcript_ids=transcript_ids,
         )
     elif args.mode == "paired":
         if not args.metadata:
@@ -203,6 +235,8 @@ def main(argv=None):
             n_permutations=args.n_permutations,
             significance_level=args.significance_level,
             lfc_threshold=args.lfc_threshold,
+            rna_region_mode=args.rna_region_mode,
+            transcript_ids=transcript_ids,
         )
 
 

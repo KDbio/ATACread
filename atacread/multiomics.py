@@ -19,14 +19,27 @@ from .signal_utils import (
 def _build_features(gtf_file, fasta_file, atac_files, rna_files,
                     genes=None, gene_file=None,
                     promoter_upstream=200, promoter_downstream=200,
-                    atac_names=None, rna_names=None):
-    from .read import fasta_read, ATACReader, RNAReader, assemble_gene_features
+                    atac_names=None, rna_names=None,
+                    rna_region_mode="exon_union", transcript_ids=None):
+    from .read import (
+        fasta_read,
+        ATACReader,
+        RNAReader,
+        assemble_gene_features,
+        configure_rna_regions,
+    )
     
     gene_df = resolve_genes(gtf_file, genes, gene_file,
                              promoter_upstream, promoter_downstream,
                              include_exons=bool(rna_files))
     if gene_df.empty:
         raise ValueError("没有找到可分析的基因")
+    if rna_files:
+        gene_df = configure_rna_regions(
+            gene_df,
+            mode=rna_region_mode,
+            transcript_ids=transcript_ids,
+        )
     
     target_chroms = sorted(set(gene_df["chrom"].dropna().astype(str)))
     print(f"[info] 加载 FASTA: {len(target_chroms)} 条目标染色体...")
@@ -192,7 +205,10 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                 bin_size="auto",
                 n_permutations=200,
                 significance_level=0.10,
-                lfc_threshold=0.25):
+                lfc_threshold=0.25,
+                rna_region_mode="exon_union",
+                transcript_ids=None,
+                _features_bundle=None):
     """
     单基因 raw 画图 + 离群检测 + 分箱置换检验。
     """
@@ -200,13 +216,18 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
         raise ValueError("profile 模式必须指定 genes 或 gene_file")
     
     os.makedirs(output_dir, exist_ok=True)
-    features, atac_names, rna_names = _build_features(
-        gtf_file, fasta_file, atac_files, rna_files,
-        genes=genes, gene_file=gene_file,
-        promoter_upstream=promoter_upstream,
-        promoter_downstream=promoter_downstream,
-        atac_names=atac_names, rna_names=rna_names,
-    )
+    if _features_bundle is None:
+        features, atac_names, rna_names = _build_features(
+            gtf_file, fasta_file, atac_files, rna_files,
+            genes=genes, gene_file=gene_file,
+            promoter_upstream=promoter_upstream,
+            promoter_downstream=promoter_downstream,
+            atac_names=atac_names, rna_names=rna_names,
+            rna_region_mode=rna_region_mode,
+            transcript_ids=transcript_ids,
+        )
+    else:
+        features, atac_names, rna_names = _features_bundle
 
     outlier_rows = []
     test_rows = []
@@ -327,7 +348,8 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
                promoter_upstream=200, promoter_downstream=200,
                atac_names=None, rna_names=None,
                lfc_threshold=0.25, significance_level=0.10,
-               make_pca=False, n_permutations=200):
+               make_pca=False, n_permutations=200,
+               rna_region_mode="exon_union", transcript_ids=None):
     """
     配对样本下 ATAC promoter + ATAC gene_body + RNA 三维方向一致性分析。
     """
@@ -340,7 +362,17 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
     if not required.issubset(meta.columns):
         raise ValueError(f"metadata 缺少列: {required - set(meta.columns)}")
     
-    # 先做 profile 复用绘图
+    features_bundle = _build_features(
+        gtf_file, fasta_file, atac_files, rna_files,
+        genes=genes, gene_file=gene_file,
+        promoter_upstream=promoter_upstream,
+        promoter_downstream=promoter_downstream,
+        atac_names=atac_names, rna_names=rna_names,
+        rna_region_mode=rna_region_mode,
+        transcript_ids=transcript_ids,
+    )
+
+    # profile 绘图和 paired 统计复用同一份特征，不再次读取输入文件。
     profile_out = run_profile(
         gtf_file, fasta_file, atac_files, rna_files,
         genes=genes, gene_file=gene_file, output_dir=output_dir,
@@ -350,15 +382,11 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
         n_permutations=n_permutations,
         significance_level=significance_level,
         lfc_threshold=lfc_threshold,
+        rna_region_mode=rna_region_mode,
+        transcript_ids=transcript_ids,
+        _features_bundle=features_bundle,
     )
-    
-    features, atac_names, rna_names = _build_features(
-        gtf_file, fasta_file, atac_files, rna_files,
-        genes=genes, gene_file=gene_file,
-        promoter_upstream=promoter_upstream,
-        promoter_downstream=promoter_downstream,
-        atac_names=atac_names, rna_names=rna_names,
-    )
+    features, atac_names, rna_names = features_bundle
     
     meta_a = meta[meta["assay"].str.upper() == "ATAC"].set_index("sample")
     meta_r = meta[meta["assay"].str.upper() == "RNA"].set_index("sample")
@@ -465,7 +493,9 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                                 bin_size="auto",
                                 n_permutations=200,
                                 significance_level=0.10,
-                                lfc_threshold=0.25):
+                                lfc_threshold=0.25,
+                                rna_region_mode="exon_union",
+                                transcript_ids=None):
     """
     兼容旧 demo 的一站式接口。
 
@@ -489,6 +519,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
         promoter_downstream=promoter_downstream,
         atac_names=atac_sample_names,
         rna_names=rna_sample_names,
+        rna_region_mode=rna_region_mode,
+        transcript_ids=transcript_ids,
     )
 
     summary_rows = []
@@ -513,6 +545,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
             "length": r.get("length", ""),
             "exon_length": r.get("exon_length", ""),
             "rna_region": r.get("rna_region", "gene_body"),
+            "rna_transcript_id": r.get("rna_transcript_id", ""),
+            "rna_length": r.get("rna_length", ""),
             "tss": r.get("tss", ""),
             "promoter_start": r.get("promoter_start", ""),
             "promoter_end": r.get("promoter_end", ""),

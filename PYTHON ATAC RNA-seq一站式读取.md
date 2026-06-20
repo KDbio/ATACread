@@ -2165,3 +2165,43 @@ Pairwise significance  1 ATAC1 vs ATAC2: NO | 2 ATAC1 vs ATAC3: YES | ...
 如果有 `n` 条轨道，两两比较数目为 `n(n-1)/2`。编号和 CSV 中的 `sample_id`、
 `comparison_id` 完全对应；项目仍保留连续的 p 值和变化倍数，图上的 YES/NO 只是按
 当前 `--significance-level` 与 `--lfc-threshold` 得到的便捷标记。
+
+### 17.FASTA 索引、指定转录本与 paired 数据复用
+
+FASTA 现在使用标准五列 `.fai` 索引。第一次读取 `genome.fa` 时会生成
+`genome.fa.fai`，之后根据索引中的字节偏移直接定位目标染色体，不再从头扫描整个
+基因组。也可以提前建立：
+
+```bash
+atacread fasta-index --fasta genome.fa
+```
+
+如果 FASTA 的修改时间晚于 `.fai`，程序会自动重建。该实现使用 Python 文件定位，
+不依赖 samtools 或其他 FASTA 库。
+
+RNA 默认行为仍是不同转录本外显子的并集：
+
+```bash
+--rna-region-mode exon_union
+```
+
+如果研究问题针对某个剪接异构体，可以为每个目标基因指定一个 transcript ID：
+
+```bash
+atacread profile \
+  -g "GENE1,GENE2" \
+  --gtf annotation.gtf \
+  --fasta genome.fa \
+  --rna "rna1.bw,rna2.bw" \
+  --rna-region-mode transcript \
+  --transcripts "ENST000001,ENST000002"
+```
+
+转录本 ID 可以带版本号，也可以不带版本号。程序会在每个基因的 GTF 转录本表中匹配；
+未找到，或者同一个基因匹配到多个用户指定转录本时，会直接报错，不会静默换成外显子
+并集。
+
+`paired` 模式过去先调用一次 `profile`，随后又重新读取 GTF、FASTA 和所有 bigWig。
+现在先构建一次特征数据，绘图、曲线检验、表达矩阵和方向分析共享同一个 DataFrame。
+命令行和输出文件不变，只减少重复 I/O 和内存分配；`paired` 同样支持上面的两个 RNA
+区域参数。

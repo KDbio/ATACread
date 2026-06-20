@@ -19,10 +19,15 @@ named `<annotation.gtf>.atacread.sqlite`. The first build scans the annotation
 once; later gene-name, Ensembl-ID, and gene-index queries reuse the cache. It
 is rebuilt automatically when the source GTF size or modification time changes.
 
+FASTA access uses a standard `<genome.fa>.fai` index. The first run builds it;
+later runs seek directly to requested chromosomes instead of scanning the
+whole genome FASTA.
+
 The index can also be prepared before an analysis:
 
 ```bash
 atacread gtf-index --gtf annotation.gtf
+atacread fasta-index --fasta genome.fa
 ```
 
 ## Installation
@@ -46,6 +51,7 @@ atacread paired    Paired ATAC/RNA direction analysis
 atacread bam       BAM QC, fragment length, FRiP, TSS, counts, and bigWig
 atacread deseq2    PyDESeq2 analysis of an integer count matrix
 atacread gtf-index Build or validate the reusable GTF SQLite index
+atacread fasta-index Build or validate the standard FASTA .fai index
 ```
 
 Multiple genes can be supplied as a text file containing one gene name,
@@ -56,6 +62,18 @@ atacread profile -f genes.txt --gtf annotation.gtf --fasta genome.fa \
   --atac "atac1.bw,atac2.bw" --rna "rna1.bw,rna2.bw" \
   --significance-level 0.10 --lfc-threshold 0.25
 ```
+
+RNA uses the union of all annotated exons by default. To analyze one explicit
+transcript per selected gene:
+
+```bash
+atacread profile -g "GENE1,GENE2" --gtf annotation.gtf --fasta genome.fa \
+  --rna "rna1.bw,rna2.bw" --rna-region-mode transcript \
+  --transcripts "ENST000001,ENST000002"
+```
+
+Versionless transcript IDs are accepted. `paired` uses the same options and
+reuses the feature data already produced for its profile plots.
 
 Run the full BAM workflow:
 

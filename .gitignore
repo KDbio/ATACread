@@ -33,6 +33,7 @@ demo_multiomics_output/
 *.tar.gz
 *.pkl
 *.atacread.sqlite*
+*.fai
 *.png
 *.jpg
 *.jpeg
