@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ATACread"
-version = "0.1.0"
-description = "A Python package for ATAC-seq and RNA-seq bigWig reading, gene-region reporting, visualization, and raw-signal tests."
+version = "0.2.0"
+description = "ATAC/RNA bigWig analysis with BAM QC, FRiP, TSS enrichment, and count matrices."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -36,4 +36,3 @@ atacrna = "atacread.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["atacread*"]
-

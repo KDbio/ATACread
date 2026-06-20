@@ -39,8 +39,12 @@ demo_multiomics_output/
 *.csv
 *.xlsx
 
+# Documentation case figures are intentionally versioned.
+!docs/
+!docs/case_results/
+!docs/case_results/*.png
+
 # Editor/system files
 .vscode/
 .DS_Store
 Thumbs.db
-

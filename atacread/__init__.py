@@ -6,11 +6,28 @@ from .multiomics import (
     run_profile,
     run_paired,
 )
+from .bam_tools import (
+    bam_qc,
+    fragment_length_distribution,
+    frip_score,
+    tss_enrichment,
+    count_matrix_from_bams,
+    bam_to_bigwig,
+    pydeseq2_differential,
+    run_bam_downstream,
+)
 
 __all__ = [
     "extract_multiomics_features",
     "run_catalog",
     "run_profile",
     "run_paired",
+    "bam_qc",
+    "fragment_length_distribution",
+    "frip_score",
+    "tss_enrichment",
+    "count_matrix_from_bams",
+    "bam_to_bigwig",
+    "pydeseq2_differential",
+    "run_bam_downstream",
 ]
-

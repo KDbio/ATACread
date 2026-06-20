@@ -1537,6 +1537,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
 bam_qc()
 fragment_length_distribution()
 plot_fragment_lengths()
+frip_score()
+tss_enrichment()
 count_reads_in_regions()
 count_matrix_from_bams()
 bam_to_bigwig()
@@ -1547,8 +1549,18 @@ run_bam_downstream()
 这里的思路是：
 
 ```text
-BAM -> QC / fragment length -> BED 区域计数 -> count matrix -> PyDESeq2
+BAM -> QC / fragment length / FRiP / TSS enrichment
+    -> BED 区域计数 -> count matrix -> PyDESeq2
+    -> CPM bigWig -> 继续使用 profile / paired 作图
 ```
+
+`bam_qc()` 除了 mapped、duplicate、MAPQ、proper pair 和线粒体比例，还输出非重复 primary read 比例和非重复片段单位比例。后者是一个简单的文库复杂度代理指标，不等同于 preseq 对文库复杂度的外推。
+
+`frip_score()` 计算通过 MAPQ、primary 和 duplicate 过滤后的片段中，有多少至少与一个 BED peak 重叠。重叠 peak 不会让同一个片段在 FRiP 分子中重复计数。
+
+`tss_enrichment()` 可以读取 BED6 或 GTF，按 ATAC 常用的正链 `+4 bp`、负链 `-5 bp` 插入位点修正，统计 TSS 两侧的聚合插入信号，并用窗口两端作为背景。输出汇总 CSV、逐位置 profile CSV 和曲线图。
+
+区域计数和 bigWig 转换需要 coordinate-sorted BAM 与索引。新版本会检查索引；如果 BAM 已按坐标排序但缺少 `.bai`，默认使用 `pysam.index()` 自动创建。未排序 BAM 会明确报错，不再悄悄生成全零矩阵或全零 bigWig。
 
 这部分更接近正式差异分析，因为标准的 ATAC 差异分析一般不是直接比较 bigWig 曲线，而是先得到 peak 或固定窗口区域上的 read count matrix，再进行统计建模。
 
@@ -1581,6 +1593,10 @@ parser.add_argument("--rna", default=None, help="Comma-separated RNA bigWig file
 parser.add_argument("--atac-names", default=None, help="Comma-separated ATAC sample names.")
 parser.add_argument("--rna-names", default=None, help="Comma-separated RNA sample names.")
 parser.add_argument("--bin-size", default="auto", help="Permutation-test bin size: auto or an integer.")
+parser.add_argument("--regions", default=None, help="BED peaks/regions for count matrix and FRiP.")
+parser.add_argument("--tss-regions", default=None, help="BED or GTF for TSS enrichment.")
+parser.add_argument("--no-auto-index", action="store_true")
+parser.add_argument("--keep-duplicates", action="store_true")
 ```
 
 如果不手动传 `--gtf`、`--fasta`、`--atac`、`--rna`，程序会尝试在 `--work-dir` 里自动找文件。不过为了避免文件名混乱，正式运行时建议还是显式写清楚路径。
@@ -1791,3 +1807,193 @@ ATACread/
 3. 数据和输出文件不会被打包进 Python 包；
 4. 读取、统计、整合、调用四个层次比较清楚；
 5. 后续如果增加 peak/count matrix 路线，也可以继续放到 `bam_tools.py` 或新模块中。
+
+### 12.实际运行案例
+
+下面记录 2026 年 6 月 19 日实际运行得到的两组结果。第一组用于确认全 GTF 基因可以被逐个读取并写入目录表，第二组使用 GSE323137 的 H23 Mock 数据比较 siNT 与 siCHD3 96 h 条件。这里保留原始 bigWig 信号，不做基线对齐，也不把曲线强行缩放到相同水平。
+
+#### 12.1 全基因 ATAC 与 RNA 整合
+
+运行命令与前面“功能一”相同，输入为 gencode v49 GTF、GRCh38.p14 FASTA、6 个 ATAC bigWig 和 3 个 RNA bigWig。程序最终生成：
+
+```text
+output_catalog_all_genes/
+├── gene_catalog.csv
+└── classification_thresholds.csv
+```
+
+本次 `gene_catalog.csv` 的实际结果为：
+
+| 项目 | 结果 |
+|---|---:|
+| 基因数 | 78,691 |
+| 数据列数 | 102 |
+| 文件大小 | 约 99.9 MB |
+| active | 6,250 |
+| intermediate | 70,171 |
+| post_transcriptional | 2,270 |
+
+102 列包含 GTF 坐标、启动子坐标，以及每个 ATAC 样本在 promoter 和 gene body 上的 `n_bp / mean / median / peak / peak_pos / auc`，每个 RNA 样本在 gene body 上也有同样的统计量。程序在 `catalog` 模式中逐基因读取并立即保存标量统计，不再把 78,691 个基因的全部逐碱基数组同时留在内存中，因此解决了此前运行到“提取 78691 个基因的特征”后被系统 `Killed` 的问题。
+
+`classification_thresholds.csv` 保存本次数据集按全基因 25% 和 75% 分位数得到的经验阈值：
+
+| 信号 | 低阈值（25%） | 高阈值（75%） |
+|---|---:|---:|
+| promoter ATAC | 0.1056 | 22.7541 |
+| gene body ATAC | 0.1182 | 5.0480 |
+| RNA gene body | 0 | 0.01682 |
+
+例如，从目录表中抽取几个常用基因，并对 6 个 ATAC 或 3 个 RNA 样本的 `mean` 再取样本间平均，可得到：
+
+| 基因 | promoter ATAC 平均值 | gene body ATAC 平均值 | RNA 平均值 | gene_state |
+|---|---:|---:|---:|---|
+| POU5F1 | 19.3013 | 16.8206 | 0.05306 | intermediate |
+| SOX2 | 76.6063 | 5.0587 | 0.000160 | intermediate |
+| NANOG | 21.0010 | 16.8313 | 0.000249 | intermediate |
+| MYC | 20.4763 | 20.7132 | 1.33674 | intermediate |
+
+这里的 `gene_state` 是根据本批数据的分位数阈值进行的描述性分类，不等于正式的差异表达结论。尤其 RNA bigWig 的量纲取决于原文件生成方式，不应直接拿这些阈值与另一个数据集比较。
+
+#### 12.2 GSE323137 多基因原始信号比较
+
+本次使用同一条命令同时读取 `ACTB、MYC、GAPDH、RPLP0`：
+
+```bash
+atacread profile \
+  -w "." \
+  -o "output_GSE323137_GAPDH_H23_Mock_compare" \
+  -g "ACTB,MYC,GAPDH,RPLP0" \
+  --gtf "data/GTF文件gencode.v49.basic.annotation.gtf" \
+  --fasta "data/FASTA文件 GRCh38.p14.genome.fa" \
+  --atac "data/GSE323137_aligned_bw/extracted/GSM9566628_ATAC_H23_Mock_siNT_96h.bw,data/GSE323137_aligned_bw/extracted/GSM9566627_ATAC_H23_Mock_siCHD3_96h.bw" \
+  --rna "data/GSE323137_aligned_bw/extracted/GSM9562953_RNA_H23_Mock_siNT.bw,data/GSE323137_aligned_bw/extracted/GSM9562952_RNA_H23_Mock_siCHD3_96h.bw" \
+  --atac-names "ATAC_siNT,ATAC_siCHD3" \
+  --rna-names "RNA_siNT,RNA_siCHD3" \
+  --promoter-upstream 2000 \
+  --promoter-downstream 500 \
+  --bin-size auto \
+  --n-permutations 200
+```
+
+这两个 RNA bigWig 使用 `1、2、3...` 作为染色体名称，而 GTF 使用 `chr1、chr2、chr3...`。读取器会自动完成 `chr12 <-> 12` 这类名称转换，所以这次 RNA 曲线不再全部为 0。
+
+每张图左侧是 2,500 bp promoter ATAC，右上是完整 gene body ATAC，右下是完整 gene body RNA。由于本次 promoter 长度大于 400 bp，程序按设定不显示逐碱基 FASTA 字母，避免横坐标挤成一团。
+
+| ACTB | MYC |
+|---|---|
+| ![ACTB 原始信号](docs/case_results/ACTB_signals.png) | ![MYC 原始信号](docs/case_results/MYC_signals.png) |
+
+| GAPDH | RPLP0 |
+|---|---|
+| ![GAPDH 原始信号](docs/case_results/GAPDH_signals.png) | ![RPLP0 原始信号](docs/case_results/RPLP0_signals.png) |
+
+`raw_permutation_tests.csv` 共得到 12 行，即 4 个基因分别比较 promoter ATAC、gene body ATAC 和 gene body RNA。下表保留最适合直接解释的 `log2(AUC ratio)`、效应量和经验 p 值，其中 A 为 siNT，B 为 siCHD3：
+
+| 基因 | 区域 | log2(AUC A/B) | effect size | p 值 | 方向 |
+|---|---|---:|---:|---:|---|
+| ACTB | ATAC promoter | 0.366 | 0.167 | 0.2090 | siNT 较高 |
+| ACTB | ATAC gene body | 0.055 | 0.030 | 0.8209 | siNT 较高 |
+| ACTB | RNA gene body | -0.268 | -0.044 | 0.6468 | siCHD3 较高 |
+| MYC | ATAC promoter | 0.305 | 0.204 | 0.0995 | siNT 较高 |
+| MYC | ATAC gene body | 0.262 | 0.146 | 0.2836 | siNT 较高 |
+| MYC | RNA gene body | 0.723 | 0.307 | 0.00995 | siNT 较高 |
+| GAPDH | ATAC promoter | 0.282 | 0.208 | 0.1095 | siNT 较高 |
+| GAPDH | ATAC gene body | 0.286 | 0.204 | 0.0746 | siNT 较高 |
+| GAPDH | RNA gene body | 0.355 | 0.152 | 0.1940 | siNT 较高 |
+| RPLP0 | ATAC promoter | 0.151 | 0.077 | 0.5373 | siNT 较高 |
+| RPLP0 | ATAC gene body | 0.247 | 0.110 | 0.3731 | siNT 较高 |
+| RPLP0 | RNA gene body | 0.247 | 0.102 | 0.4527 | siNT 较高 |
+
+从这次结果看，ATAC 的大多数比较方向为 siNT 较高，但效应量不大，200 次置换下没有一项达到 `p < 0.05`。RNA 中只有 MYC 在未做多重检验校正时达到 `p = 0.00995`，对应 AUC 约为 siCHD3 的 1.65 倍。其余结果只能描述为趋势，不能直接写成显著差异。
+
+这里一共进行了 12 项检验，目前 CSV 中保存的是未经多重校正的经验 p 值。如果按 12 项做 Bonferroni 校正，阈值约为 `0.00417`；200 次置换能够得到的最小经验 p 值约为 `1 / 201 = 0.00498`，因此本案例不适合据此给出经过严格多重校正的显著性结论。它更适合作为曲线级初筛，正式差异分析仍应使用有生物学重复的 BAM/peak count matrix。
+
+本次 `outliers.csv` 为空也不能解释为“已经证明没有异常样本”。当前异常检测至少需要 3 个同类样本，而这里每种组学只有 siNT 和 siCHD3 两条曲线，因此程序跳过了异常值判断。
+
+### 13.BAM 质控、统计和 bigWig 转换
+
+从 0.2.0 版本开始，BAM 模块不仅保留区域计数和 bigWig 转换，还补充了 FRiP、TSS enrichment、非重复片段比例、输入校验和自动索引。
+
+安装完整依赖：
+
+```bash
+pip install -e ".[all]"
+```
+
+如果只想检查 BAM 和片段长度，不需要 BED：
+
+```bash
+atacread bam \
+  --bam "sample1.bam,sample2.bam" \
+  --sample-names "sample1,sample2" \
+  --no-bigwig \
+  -o "output_bam_qc"
+```
+
+完整运行 QC、fragment length、FRiP、TSS enrichment、count matrix 和 bigWig：
+
+```bash
+atacread bam \
+  --bam "sample1.bam,sample2.bam" \
+  --sample-names "sample1,sample2" \
+  --regions "consensus_peaks.bed" \
+  --tss-regions "genes_tss.bed" \
+  --min-mapq 30 \
+  --bigwig-bin-size 50 \
+  -o "output_bam_full"
+```
+
+`--tss-regions` 也可以直接传 GTF，但全 GTF 会比精简后的 TSS BED 慢。默认排除 secondary、supplementary、低 MAPQ 和 duplicate reads；只有在明确需要时才添加 `--keep-duplicates`。
+
+主要输出为：
+
+```text
+bam_qc_summary.csv
+fragment_summary.csv
+frip_summary.csv
+tss_enrichment_summary.csv
+sample1_fragment_lengths.csv
+sample1_fragment_lengths.png
+sample1_tss_profile.csv
+sample1_tss_enrichment.png
+count_matrix.csv
+sample1.bin50.cpm.bw
+```
+
+`count_matrix.csv` 可继续交给纯 Python 的 PyDESeq2：
+
+```bash
+atacread deseq2 \
+  --count-matrix "output_bam_full/count_matrix.csv" \
+  --metadata "metadata.csv" \
+  --condition-col "condition" \
+  --reference-level "control:treat" \
+  -o "output_deseq2"
+```
+
+metadata 至少包含：
+
+```csv
+sample,condition
+sample1,control
+sample2,treat
+```
+
+PyDESeq2 必须使用 BAM/peak 得到的非负整数 count matrix，不能把 bigWig 的连续信号直接当 count 输入。
+
+#### 本地数据与测试情况
+
+当前 `data/` 目录和 `GSE323137_RAW.tar` 的文件清单中没有 `.bam / .bai / .cram / .sam`，只有 bigWig、GTF、FASTA 和压缩包，因此暂时不能用已下载的真实数据验证 BAM 模块。
+
+代码测试使用 `pysam` 生成了一个 coordinate-sorted 的合成双端 BAM，其中预先设置了 10 个 peak 内片段、5 个有效背景片段、重复片段和低 MAPQ 片段。测试确认：
+
+1. 缺少索引时可以自动生成 `.bai`；
+2. FRiP 正确得到 `10 / 15 = 0.6667`；
+3. peak count matrix 正确得到 10；
+4. TSS enrichment 大于 1，并输出 profile 和图片；
+5. bigWig 在 peak 区域存在非零覆盖；
+6. BAM 数量与 sample name 数量不一致时会报错；
+7. 不提供 BED 时，命令行仍可以单独执行 BAM QC 和 fragment length。
+8. PyDESeq2 0.5.2 可以直接读取 count matrix CSV；在 6 个合成样本、40 个 peak 的测试中，预设升高的前 8 个 peak 均得到正 log2 fold change 和显著的校正 p 值。
+
+这个合成测试用于确认程序逻辑和文件链路，不代表真实样本的质量。真实 BAM 到位后仍应检查测序类型、单双端、参考基因组版本、染色体命名和 peak BED 是否匹配。

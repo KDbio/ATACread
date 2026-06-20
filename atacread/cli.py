@@ -76,10 +76,16 @@ def main(argv=None):
 
     parser.add_argument("--bam", default=None, help="Comma-separated BAM files for BAM mode.")
     parser.add_argument("--regions", default=None, help="BED regions for BAM counting.")
+    parser.add_argument("--tss-regions", default=None,
+                        help="BED or GTF used for BAM TSS enrichment.")
     parser.add_argument("--sample-names", default=None, help="Comma-separated sample names for BAM mode.")
     parser.add_argument("--min-mapq", type=int, default=30)
     parser.add_argument("--bigwig-bin-size", type=int, default=50)
     parser.add_argument("--no-bigwig", action="store_true")
+    parser.add_argument("--no-auto-index", action="store_true",
+                        help="Do not create a missing index for coordinate-sorted BAM files.")
+    parser.add_argument("--keep-duplicates", action="store_true",
+                        help="Keep duplicate reads/fragments in BAM-derived analyses.")
 
     parser.add_argument("--count-matrix", default=None, help="Count matrix CSV for deseq2 mode.")
     parser.add_argument("--condition-col", default="condition")
@@ -93,8 +99,6 @@ def main(argv=None):
 
     if args.mode == "bam":
         bams = _split_csv(args.bam) if args.bam else auto_find(args.work_dir, [".bam"])
-        if not args.regions:
-            raise ValueError("bam mode requires --regions")
         outputs = run_bam_downstream(
             bams,
             args.regions,
@@ -103,8 +107,11 @@ def main(argv=None):
             min_mapq=args.min_mapq,
             make_bigwig=not args.no_bigwig,
             bigwig_bin_size=args.bigwig_bin_size,
+            tss_regions=args.tss_regions,
+            auto_index=not args.no_auto_index,
+            keep_duplicates=args.keep_duplicates,
         )
-        print(outputs)
+        print({k: v for k, v in outputs.items() if k != "count_matrix"})
         return
 
     if args.mode == "deseq2":
@@ -175,4 +182,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
