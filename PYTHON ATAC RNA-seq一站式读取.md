@@ -1997,3 +1997,96 @@ PyDESeq2 必须使用 BAM/peak 得到的非负整数 count matrix，不能把 bi
 8. PyDESeq2 0.5.2 可以直接读取 count matrix CSV；在 6 个合成样本、40 个 peak 的测试中，预设升高的前 8 个 peak 均得到正 log2 fold change 和显著的校正 p 值。
 
 这个合成测试用于确认程序逻辑和文件链路，不代表真实样本的质量。真实 BAM 到位后仍应检查测序类型、单双端、参考基因组版本、染色体命名和 peak BED 是否匹配。
+
+### 14.真实人类 BAM 到 bigWig 案例
+
+为了验证 BAM 模块不是只对合成文件有效，选择了 ENCODE 的公开人类 K562 ATAC-seq 数据：
+
+```text
+实验：ENCSR859USB
+样本：Homo sapiens K562
+参考基因组：GRCh38
+BAM：ENCFF557RSA
+文件类型：filtered paired-end alignments
+文件大小：690,935,841 bytes
+MD5：6d329f0d2d677a6dc745f02c8bf7121c
+配套 replicate-1 IDR peaks：ENCFF202HWV
+```
+
+公开页面：
+
+```text
+https://www.encodeproject.org/experiments/ENCSR859USB/
+https://www.encodeproject.org/files/ENCFF557RSA/
+https://www.encodeproject.org/files/ENCFF202HWV/
+```
+
+文件下载到：
+
+```text
+data/ENCODE_human_ATAC_K562/ENCFF557RSA.bam
+data/ENCODE_human_ATAC_K562/ENCFF557RSA.bam.bai
+data/ENCODE_human_ATAC_K562/ENCFF202HWV.bed
+```
+
+MD5 与 ENCODE 元数据完全一致。BAM 为 coordinate-sorted，包自动生成了 3.47 MB 的 `.bai` 索引。
+
+#### 真实 BAM 质控结果
+
+| 指标 | 结果 |
+|---|---:|
+| BAM records | 17,171,518 |
+| mapped rate | 1.0000 |
+| proper pair rate | 1.0000 |
+| MAPQ >= 30 | 0.9696 |
+| 有效片段数 | 8,318,496 |
+| 片段长度中位数 | 133 bp |
+| 小于 100 bp 的片段比例 | 0.4239 |
+| 140-220 bp 单核小体片段比例 | 0.1855 |
+| FRiP（31,420 个 replicate-1 peaks） | 0.2078 |
+| TSS enrichment（gencode v49，78,691 TSS） | 13.5461 |
+
+这个 BAM 已经过 ENCODE 过滤和去重复，所以 duplicate rate 和线粒体 reads 为 0。我们用 gencode v49 全部 gene 计算出的 TSS enrichment 为 13.55，而 ENCODE 页面记录约 22.19；二者使用的 TSS 集合、过滤方式和背景归一化并不完全相同，因此不应要求数值完全一致。
+
+#### 使用 Python 把 BAM 转为 bigWig
+
+```python
+from pathlib import Path
+from atacread import bam_to_bigwig
+
+bam_to_bigwig(
+    bam_file=Path("data/ENCODE_human_ATAC_K562/ENCFF557RSA.bam"),
+    output_bw=Path("output_ENCODE_K562_BAM_QC/K562_ATAC_rep1.bin50.cpm.bw"),
+    bin_size=50,
+    min_mapq=30,
+    normalize="CPM",
+    count_fragments=True,
+    keep_duplicates=False,
+    auto_index=True,
+)
+```
+
+生成结果：
+
+```text
+output_ENCODE_K562_BAM_QC/K562_ATAC_rep1.bin50.cpm.bw
+文件大小：287,586,730 bytes
+染色体/参考序列数：195
+chr1 长度：248,956,422 bp
+```
+
+在配套 peak `chr22:21641857-21642551` 中检查得到：
+
+```text
+mean CPM coverage = 22.1239
+max CPM coverage  = 36.1108
+```
+
+因此该文件不是空轨道，也不是全零轨道。随后将新生成的 bigWig 重新交给 `run_profile()`，读取 MYC 的 promoter 与 gene body：
+
+![ENCODE K562 BAM 转 bigWig 后的 MYC ATAC 信号](docs/case_results/ENCODE_K562_BAM_to_BW_MYC.png)
+
+这个案例也补充了两个接口修复：
+
+1. `bam_to_bigwig()` 和 `BigWigReader` 均支持 `pathlib.Path`；
+2. 只输入 ATAC、不输入 RNA 时，绘图自动使用两栏布局，不再保留空白 RNA 面板。

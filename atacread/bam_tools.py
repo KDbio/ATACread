@@ -657,6 +657,8 @@ def bam_to_bigwig(bam_file, output_bw, bin_size=50, min_mapq=30,
     """
     pysam = _require_pysam()
     pyBigWig = _require_pybigwig()
+    bam_file = str(bam_file)
+    output_bw = str(output_bw)
     ensure_bam_index(bam_file, auto_index=auto_index)
     bin_size = max(1, int(bin_size))
     os.makedirs(os.path.dirname(str(output_bw)) or ".", exist_ok=True)

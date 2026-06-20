@@ -352,9 +352,9 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
                       output_png, title_suffix="", promoter_seq=None,
                       promoter_seq_max_len=400):
     """
-    每个基因 3 面板整合图：
+    每个基因整合图：
         Left:  promoter ATAC raw
-        Right: gene_body ATAC raw + gene_body RNA raw
+        Right: gene_body ATAC raw；有 RNA 时再增加 gene_body RNA raw
     """
     show_promoter_seq = (
         promoter_seq is not None
@@ -369,15 +369,17 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
         wspace=0.18,
         hspace=0.34 if show_promoter_seq else 0.26,
     )
+    has_rna = bool(rna_raw)
     ax_promoter = fig.add_subplot(grid[:, 0])
-    ax_atac_body = fig.add_subplot(grid[0, 1])
-    ax_rna_body = fig.add_subplot(grid[1, 1])
+    ax_atac_body = fig.add_subplot(grid[0, 1] if has_rna else grid[:, 1])
+    ax_rna_body = fig.add_subplot(grid[1, 1]) if has_rna else None
     
     panels = [
         (ax_promoter, atac_promoter_raw, "Promoter ATAC (raw)", "raw ATAC"),
         (ax_atac_body, atac_genebody_raw, "Gene body ATAC (raw)", "raw ATAC"),
-        (ax_rna_body, rna_raw, "Gene body RNA (raw)", "raw RNA"),
     ]
+    if has_rna:
+        panels.append((ax_rna_body, rna_raw, "Gene body RNA (raw)", "raw RNA"))
     
     for ax, data, title, ylabel in panels:
         if data:
@@ -394,7 +396,8 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
         ax_promoter.set_xlabel("Position in promoter (bp)")
     
     ax_atac_body.set_xlabel("Position in gene body (bp)")
-    ax_rna_body.set_xlabel("Position in gene body (bp)")
+    if ax_rna_body is not None:
+        ax_rna_body.set_xlabel("Position in gene body (bp)")
     
     fig.suptitle(f"{gene_name}  {title_suffix}", fontsize=12, y=1.005)
     fig.savefig(output_png, dpi=130, bbox_inches="tight")

@@ -592,18 +592,18 @@ class BigWigReader:
         label : str
             信号类型标签，例如 "atac" / "rna"，用作输出列名前缀。
         """
-        if isinstance(bw_files, str):
+        if isinstance(bw_files, (str, os.PathLike)):
             bw_files = [bw_files]
 
-        self.bw_files = bw_files
+        self.bw_files = [str(f) for f in bw_files]
         self.label = label
         self.regions = regions or ("gene_body",)
 
         if sample_names is None:
             sample_names = [
-                os.path.splitext(os.path.basename(f))[0] for f in bw_files
+                os.path.splitext(os.path.basename(f))[0] for f in self.bw_files
             ]
-        if len(sample_names) != len(bw_files):
+        if len(sample_names) != len(self.bw_files):
             raise ValueError("sample_names 长度必须与 bw_files 一致")
         self.sample_names = sample_names
 

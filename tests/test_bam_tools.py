@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - optional dependency
     pyBigWig = None
     pysam = None
 
-from atacread.bam_tools import run_bam_downstream
+from atacread.bam_tools import bam_to_bigwig, run_bam_downstream
 from atacread.cli import main as cli_main
 
 
@@ -118,6 +118,15 @@ class BamToolsIntegrationTest(unittest.TestCase):
             with pyBigWig.open(str(bw_path)) as bw:
                 values = np.asarray(bw.values("chr1", 2400, 2600), dtype=float)
                 self.assertGreater(float(np.nanmax(values)), 0.0)
+
+            direct_bw = tmp / "path_object_output.bw"
+            bam_to_bigwig(bam, direct_bw, bin_size=25, min_mapq=30)
+            self.assertTrue(direct_bw.exists())
+            from atacread.read import ATACReader
+
+            with ATACReader([direct_bw], sample_names=["path_sample"]) as reader:
+                signal = reader.fetch_region("chr1", 2400, 2600)
+            self.assertGreater(float(np.nanmax(next(iter(signal.values())))), 0.0)
 
     def test_sample_name_count_is_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
