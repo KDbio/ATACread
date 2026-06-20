@@ -71,6 +71,10 @@ def main(argv=None):
     parser.add_argument("--promoter-downstream", type=int, default=200, help="Promoter downstream length.")
     parser.add_argument("--bin-size", default="auto", help="Permutation-test bin size: auto or an integer.")
     parser.add_argument("--n-permutations", type=int, default=200, help="Permutation count for raw-signal tests.")
+    parser.add_argument("--significance-level", type=float, default=0.10,
+                        help="Exploratory p-value cutoff (default: 0.10).")
+    parser.add_argument("--lfc-threshold", type=float, default=0.25,
+                        help="Minimum absolute log2 fold change (default: 0.25).")
     parser.add_argument("--pca", action="store_true", help="Run RNA PCA in paired mode.")
     parser.add_argument("--no-classify", action="store_true", help="Do not classify gene states in catalog mode.")
 
@@ -158,6 +162,8 @@ def main(argv=None):
             rna_names=rna_names,
             bin_size=args.bin_size,
             n_permutations=args.n_permutations,
+            significance_level=args.significance_level,
+            lfc_threshold=args.lfc_threshold,
         )
     elif args.mode == "paired":
         if not args.metadata:
@@ -177,6 +183,8 @@ def main(argv=None):
             rna_names=rna_names,
             make_pca=args.pca,
             n_permutations=args.n_permutations,
+            significance_level=args.significance_level,
+            lfc_threshold=args.lfc_threshold,
         )
 
 

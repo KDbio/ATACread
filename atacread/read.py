@@ -1,5 +1,6 @@
 import re
 import os
+import gzip
 import pandas as pd
 import numpy as np
 import scipy
@@ -176,7 +177,7 @@ class GTFReader:
         """遍历 GTF 文件，返回 DataFrame 或 list[dict]。"""
         records = []
 
-        with open(self.gtf_file, "rt", encoding="utf-8") as gtf:
+        with _open_text_auto(self.gtf_file) as gtf:
             for line in gtf:
                 record = self._parse_line(line)
                 if record is None:
@@ -274,6 +275,162 @@ class GTFQueryReader(GTFReader):
             return pd.DataFrame(records) if records else pd.DataFrame()
         else:
             return {r["query"]: r for r in records}
+
+
+def _open_text_auto(path):
+    """Open plain-text or gzip-compressed annotation files."""
+    path = str(path)
+    opener = gzip.open if path.lower().endswith(".gz") else open
+    return opener(path, "rt", encoding="utf-8")
+
+
+def _merge_intervals(intervals):
+    """Merge overlapping exon intervals in genomic coordinate order."""
+    merged = []
+    for start, end in sorted(intervals):
+        start, end = int(start), int(end)
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def attach_exon_intervals(gtf_file, gene_df):
+    """
+    Attach the union of all annotated exons for each selected gene.
+
+    Exons from alternative transcripts are merged, so an RNA position is used
+    once even when it occurs in several transcript isoforms. Coordinates remain
+    0-based half-open genomic intervals.
+    """
+    if gene_df is None or gene_df.empty:
+        return gene_df
+
+    full_ids = set(gene_df["gene_id"].dropna().astype(str))
+    base_ids = set(gene_df["gene_id_base"].dropna().astype(str))
+    intervals_by_base = {gene_id: [] for gene_id in base_ids}
+    completed = set()
+    active_target = None
+
+    with _open_text_auto(gtf_file) as gtf:
+        for line in gtf:
+            if not line or line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) != 9:
+                continue
+            if cols[2] not in {"gene", "exon"}:
+                continue
+            attrs = GTFReader.parse_attributes(cols[8])
+            gene_id = attrs.get("gene_id")
+            if gene_id is None:
+                continue
+            gene_id_base = gene_id.split(".")[0]
+
+            # GENCODE groups a gene row and its child records together. Once
+            # every selected gene block has ended, a profile query can stop
+            # without scanning the rest of a multi-gigabyte GTF.
+            if cols[2] == "gene":
+                if active_target is not None:
+                    completed.add(active_target)
+                    if completed >= base_ids:
+                        break
+                active_target = gene_id_base if gene_id_base in base_ids else None
+                continue
+
+            if cols[2] != "exon":
+                continue
+            if gene_id not in full_ids and gene_id_base not in base_ids:
+                continue
+            intervals_by_base.setdefault(gene_id_base, []).append(
+                (int(cols[3]) - 1, int(cols[4]))
+            )
+
+    merged_by_base = {
+        gene_id: _merge_intervals(intervals)
+        for gene_id, intervals in intervals_by_base.items()
+    }
+    out = gene_df.copy()
+    out["exon_intervals"] = [
+        merged_by_base.get(str(gene_id), [])
+        for gene_id in out["gene_id_base"]
+    ]
+    out["exon_length"] = [
+        int(sum(end - start for start, end in intervals))
+        for intervals in out["exon_intervals"]
+    ]
+    return out
+
+
+def query_genes_with_exons(gtf_file, queries, promoter_upstream=200,
+                            promoter_downstream=200, verbose=True):
+    """Find named genes and collect their exon unions in one GTF pass."""
+    reader = GTFQueryReader(
+        gtf_file,
+        queries=queries,
+        promoter_upstream=promoter_upstream,
+        promoter_downstream=promoter_downstream,
+        verbose=False,
+    )
+    records = []
+    active_record = None
+    active_intervals = []
+
+    def finish_active():
+        nonlocal active_record, active_intervals
+        if active_record is None:
+            return
+        merged = _merge_intervals(active_intervals)
+        active_record["exon_intervals"] = merged
+        active_record["exon_length"] = int(
+            sum(end - start for start, end in merged)
+        )
+        records.append(active_record)
+        active_record = None
+        active_intervals = []
+
+    with _open_text_auto(gtf_file) as gtf:
+        for line in gtf:
+            if not line or line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) != 9:
+                continue
+
+            if cols[2] == "gene":
+                finish_active()
+                if len(reader._found_keys) >= len(reader.queries):
+                    break
+                record = reader._parse_line(line)
+                if record is not None and reader._accept_record(record):
+                    active_record = record
+                continue
+
+            if cols[2] != "exon" or active_record is None:
+                continue
+            attrs = GTFReader.parse_attributes(cols[8])
+            exon_gene = attrs.get("gene_id", "").split(".")[0]
+            if exon_gene == active_record["gene_id_base"]:
+                active_intervals.append((int(cols[3]) - 1, int(cols[4])))
+
+    finish_active()
+    if verbose:
+        found = {
+            record.get("query", record["gene_id_base"])
+            for record in records
+        }
+        missing = [
+            query for query in reader.queries
+            if query not in found and query.split(".")[0] not in found
+        ]
+        if missing:
+            print(f"[warning] 以下基因没有找到 (共 {len(missing)} 个):")
+            for query in missing:
+                print(f"  - {query}")
+    return pd.DataFrame(records) if records else pd.DataFrame()
 
 
 # ============================================================
@@ -752,7 +909,7 @@ class ATACReader(BigWigReader):
 
 
 class RNAReader(BigWigReader):
-    """RNA-seq BigWig 读取器，读取 gene_body 区段。"""
+    """RNA-seq BigWig reader; annotated exons are concatenated when available."""
 
     def __init__(self, bw_files, sample_names=None):
         super().__init__(
@@ -761,6 +918,46 @@ class RNAReader(BigWigReader):
             label="rna",
             regions=("gene_body",),
         )
+
+    def fetch_gene(self, gene_info):
+        """
+        Read the union of annotated exons in transcript orientation.
+
+        Falling back to the whole gene body keeps compatibility with custom
+        gene records that do not contain ``exon_intervals``.
+        """
+        intervals = gene_info.get("exon_intervals")
+        if not isinstance(intervals, (list, tuple)) or not intervals:
+            return super().fetch_gene(gene_info)
+
+        self._open()
+        chrom = gene_info["chrom"]
+        strand = gene_info.get("strand", "+")
+        gene_start = int(gene_info["start"])
+        gene_end = int(gene_info["end"])
+        clipped = _merge_intervals([
+            (max(gene_start, int(start)), min(gene_end, int(end)))
+            for start, end in intervals
+        ])
+
+        result = {}
+        for bw, chroms, name in zip(self._bw_handles, self._bw_chroms, self.sample_names):
+            gene_values = self._fetch_one(
+                bw, chroms, chrom, gene_start, gene_end
+            )
+            chunks = [
+                gene_values[start - gene_start:end - gene_start]
+                for start, end in clipped
+                if end > start
+            ]
+            values = (
+                np.concatenate(chunks).astype(np.float32, copy=False)
+                if chunks else np.zeros(0, dtype=np.float32)
+            )
+            if strand == "-":
+                values = values[::-1]
+            result[f"rna_{name}_gene_body_signal"] = values
+        return result
 
 
 # ============================================================
@@ -873,6 +1070,8 @@ def assemble_gene_features(
             "start": gene_info["start"],
             "end": gene_info["end"],
             "length": gene_info.get("length", gene_info["end"] - gene_info["start"]),
+            "exon_length": gene_info.get("exon_length"),
+            "rna_region": "merged_exons" if gene_info.get("exon_intervals") else "gene_body",
             "tss": gene_info.get("tss"),
             "promoter_start": gene_info.get("promoter_start"),
             "promoter_end": gene_info.get("promoter_end"),

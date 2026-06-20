@@ -3,6 +3,12 @@
 ATACread is a Python package for gene-level ATAC-seq/RNA-seq bigWig reading,
 plotting, raw-signal comparison, and BAM-derived ATAC quality control.
 
+RNA profiles use the merged union of all GTF exons when exon annotations are
+available, so introns do not dilute conventional RNA-seq comparisons. Raw
+signal comparisons use a paired binned sign-flip test and report p-values plus
+effect sizes. Exploratory defaults are `p <= 0.10` and
+`abs(log2 fold change) >= 0.25`.
+
 ## Installation
 
 ```bash
@@ -30,7 +36,8 @@ Ensembl ID, or GTF gene index per line:
 
 ```bash
 atacread profile -f genes.txt --gtf annotation.gtf --fasta genome.fa \
-  --atac "atac1.bw,atac2.bw" --rna "rna1.bw,rna2.bw"
+  --atac "atac1.bw,atac2.bw" --rna "rna1.bw,rna2.bw" \
+  --significance-level 0.10 --lfc-threshold 0.25
 ```
 
 Run the full BAM workflow:

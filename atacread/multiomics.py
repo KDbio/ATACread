@@ -22,7 +22,8 @@ def _build_features(gtf_file, fasta_file, atac_files, rna_files,
     from .read import fasta_read, ATACReader, RNAReader, assemble_gene_features
     
     gene_df = resolve_genes(gtf_file, genes, gene_file,
-                             promoter_upstream, promoter_downstream)
+                             promoter_upstream, promoter_downstream,
+                             include_exons=bool(rna_files))
     if gene_df.empty:
         raise ValueError("没有找到可分析的基因")
     
@@ -101,6 +102,7 @@ def run_catalog(gtf_file, fasta_file, atac_files=None, rna_files=None,
         gene_file=None,
         promoter_upstream=promoter_upstream,
         promoter_downstream=promoter_downstream,
+        include_exons=bool(rna_files),
     )
     if gene_df.empty:
         raise ValueError("没有找到可分析的基因")
@@ -111,7 +113,8 @@ def run_catalog(gtf_file, fasta_file, atac_files=None, rna_files=None,
     rna_names = rna.sample_names if rna else []
     
     base_cols = ["gene_id", "gene_name", "gene_type", "chrom", "strand",
-                 "start", "end", "length", "tss", "promoter_start", "promoter_end"]
+                 "start", "end", "length", "exon_length", "tss",
+                 "promoter_start", "promoter_end"]
     
     rows = []
     try:
@@ -186,7 +189,9 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                 atac_names=None, rna_names=None,
                 outlier_z=2.5,
                 bin_size="auto",
-                n_permutations=200):
+                n_permutations=200,
+                significance_level=0.10,
+                lfc_threshold=0.25):
     """
     单基因 raw 画图 + 离群检测 + 分箱置换检验。
     """
@@ -221,7 +226,7 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
         for label, signals in [
             ("ATAC_promoter", atac_p_raw),
             ("ATAC_genebody", atac_g_raw),
-            ("RNA_genebody", rna_raw),
+            ("RNA_merged_exons", rna_raw),
         ]:
             if len(signals) >= 3:
                 odf = detect_outliers(signals, z_threshold=outlier_z)
@@ -236,6 +241,8 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                     bin_size=bin_size,
                     n_permutations=n_permutations,
                     region_name=label,
+                    significance_level=significance_level,
+                    log2fc_threshold=lfc_threshold,
                 )
                 if not tdf.empty:
                     tdf["gene_id"] = gid
@@ -283,8 +290,8 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
                output_dir="output_paired",
                promoter_upstream=200, promoter_downstream=200,
                atac_names=None, rna_names=None,
-               lfc_threshold=0.5, make_pca=False,
-               n_permutations=200):
+               lfc_threshold=0.25, significance_level=0.10,
+               make_pca=False, n_permutations=200):
     """
     配对样本下 ATAC promoter + ATAC gene_body + RNA 三维方向一致性分析。
     """
@@ -305,6 +312,8 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
         promoter_downstream=promoter_downstream,
         atac_names=atac_names, rna_names=rna_names,
         n_permutations=n_permutations,
+        significance_level=significance_level,
+        lfc_threshold=lfc_threshold,
     )
     
     features, atac_names, rna_names = _build_features(
@@ -327,11 +336,14 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
         a = df[df["group"] == groups[0]]["value"].to_numpy()
         b = df[df["group"] == groups[1]]["value"].to_numpy()
         lfc = float(np.log2((b.mean() + 1e-6) / (a.mean() + 1e-6)))
-        p = _two_group_permutation_p(
-            a,
-            b,
-            n_permutations=n_permutations,
-            random_state=random_state,
+        p = (
+            _two_group_permutation_p(
+                a,
+                b,
+                n_permutations=n_permutations,
+                random_state=random_state,
+            )
+            if len(a) >= 2 and len(b) >= 2 else np.nan
         )
         return lfc, p, f"{groups[1]}_vs_{groups[0]}"
     
@@ -362,6 +374,23 @@ def run_paired(gtf_file, fasta_file, atac_files, rna_files, metadata_file,
             "promoter_ATAC_log2fc": p_lfc, "promoter_ATAC_p": p_p,
             "genebody_ATAC_log2fc": g_lfc, "genebody_ATAC_p": g_p,
             "RNA_log2fc": r_lfc, "RNA_p": r_p,
+            "significance_level": significance_level,
+            "log2fc_threshold": lfc_threshold,
+            "promoter_ATAC_significant": bool(
+                np.isfinite(p_p) and p_p <= significance_level
+                and abs(p_lfc) >= lfc_threshold
+            ),
+            "genebody_ATAC_significant": bool(
+                np.isfinite(g_p) and g_p <= significance_level
+                and abs(g_lfc) >= lfc_threshold
+            ),
+            "RNA_significant": bool(
+                np.isfinite(r_p) and r_p <= significance_level
+                and abs(r_lfc) >= lfc_threshold
+            ),
+            "replicate_test_available": bool(
+                np.isfinite(p_p) or np.isfinite(g_p) or np.isfinite(r_p)
+            ),
             "direction": direction,
         })
     
@@ -398,7 +427,9 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                                 plot_first_n=10,
                                 outlier_z=2.5,
                                 bin_size="auto",
-                                n_permutations=200):
+                                n_permutations=200,
+                                significance_level=0.10,
+                                lfc_threshold=0.25):
     """
     兼容旧 demo 的一站式接口。
 
@@ -443,6 +474,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
             "start": r.get("start", ""),
             "end": r.get("end", ""),
             "length": r.get("length", ""),
+            "exon_length": r.get("exon_length", ""),
+            "rna_region": r.get("rna_region", "gene_body"),
             "tss": r.get("tss", ""),
             "promoter_start": r.get("promoter_start", ""),
             "promoter_end": r.get("promoter_end", ""),
@@ -480,7 +513,7 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
         for label, signals in [
             ("ATAC_promoter", atac_p_raw),
             ("ATAC_genebody", atac_g_raw),
-            ("RNA_genebody", rna_raw),
+            ("RNA_merged_exons", rna_raw),
         ]:
             if len(signals) >= 3:
                 odf = detect_outliers(signals, z_threshold=outlier_z)
@@ -495,6 +528,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                     bin_size=bin_size,
                     n_permutations=n_permutations,
                     region_name=label,
+                    significance_level=significance_level,
+                    log2fc_threshold=lfc_threshold,
                 )
                 if not tdf.empty:
                     tdf["gene_id"] = gene_id

@@ -2090,3 +2090,40 @@ max CPM coverage  = 36.1108
 
 1. `bam_to_bigwig()` 和 `BigWigReader` 均支持 `pathlib.Path`；
 2. 只输入 ATAC、不输入 RNA 时，绘图自动使用两栏布局，不再保留空白 RNA 面板。
+### 15.RNA 外显子区域与较宽松的变化判定
+
+真核基因的基因本体中通常含有较长的内含子。对常规 RNA-seq bigWig 来说，直接把
+整个基因本体取平均，会让大量没有成熟 RNA 覆盖的内含子把表达差异稀释掉。现在程序
+读取 GTF 中同一基因的所有 `exon` 行，先合并不同转录本之间重叠的外显子，再按转录
+方向拼接信号。这里没有只选 CDS，因为 5′/3′ UTR 和非编码 RNA 也属于实际转录区域。
+没有外显子注释的自定义基因记录才回退到整个 gene body。
+
+同一基因的两条曲线具有对应的基因组位置，因此曲线比较改为“分箱后配对符号翻转
+检验”。默认使用 200 次随机翻转，并同时满足下面两个条件时标记为变化：
+
+```text
+p_value <= 0.10
+abs(log2_auc_ratio) >= 0.25
+```
+
+这比原先按 `0.05` 和 `0.5` 理解变化更宽松。CSV 仍保留原始 `p_value`、
+`log2_auc_ratio` 和 `effect_size`，同时增加 `significant` 与 `change_call`，因此用户
+可以自己重新设定标准，而不是只能接受程序给出的二元结论。
+
+```bash
+atacread profile \
+  --gtf annotation.gtf \
+  --fasta genome.fa \
+  --genes GAPDH \
+  --atac "atac_control.bw,atac_treat.bw" \
+  --rna "rna_control.bw,rna_treat.bw" \
+  --significance-level 0.10 \
+  --lfc-threshold 0.25 \
+  --n-permutations 200 \
+  -o output_GAPDH
+```
+
+需要注意：如果每组只有一个生物学样本，不能用“样本间检验”估计生物学重复的方差，
+此时 `direction_analysis.csv` 的样本级 p 值会留空；仍可查看
+`raw_permutation_tests.csv` 的同一区域曲线差异，但它表示观察到的信号曲线不同，不能
+替代具有生物学重复的正式差异表达分析。

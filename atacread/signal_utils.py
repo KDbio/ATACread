@@ -77,11 +77,13 @@ def bin_signal(signal, bin_size=20, agg="mean"):
 
 def binned_permutation_test(signal_a, signal_b, bin_size="auto",
                             n_permutations=200, agg="mean",
-                            random_state=0, region_name=None):
+                            random_state=0, region_name=None,
+                            significance_level=0.10,
+                            log2fc_threshold=0.25):
     """
     比较两条 raw accessibility 曲线的观察差异。
 
-    统计单位是 bin，不是单个碱基；p 值来自标签随机置换。
+    统计单位是对应位置的 bin，不是单个碱基；p 值来自配对差值的随机符号翻转。
     这个检验回答的是“观察信号是否不同”，不区分批次差异和生物学差异。
     """
     arr_a = to_array(signal_a)
@@ -97,7 +99,7 @@ def binned_permutation_test(signal_a, signal_b, bin_size="auto",
     b = b[np.isfinite(b)]
     if len(a) == 0 or len(b) == 0:
         return {
-            "test": "binned_permutation",
+            "test": "paired_binned_sign_flip",
             "bin_size": int(resolved_bin_size),
             "bin_size_mode": "auto" if isinstance(bin_size, str) else "fixed",
             "n_permutations": int(n_permutations),
@@ -112,35 +114,46 @@ def binned_permutation_test(signal_a, signal_b, bin_size="auto",
             "log2_auc_ratio": np.nan,
             "effect_size": np.nan,
             "p_value": np.nan,
+            "significance_level": float(significance_level),
+            "log2fc_threshold": float(log2fc_threshold),
+            "significant": False,
+            "change_call": "insufficient_data",
             "direction": "unknown",
             "interpretation": "raw_observed_difference",
         }
 
     eps = 1e-9
-    observed = float(np.mean(a) - np.mean(b))
-    pooled = np.concatenate([a, b])
-    n_a = len(a)
+    n_paired = min(len(a), len(b))
+    a = a[:n_paired]
+    b = b[:n_paired]
+    differences = a - b
+    observed = float(np.mean(differences))
     rng = np.random.default_rng(random_state)
     null = np.empty(int(n_permutations), dtype=np.float64)
     for i in range(int(n_permutations)):
-        perm = rng.permutation(pooled)
-        null[i] = np.mean(perm[:n_a]) - np.mean(perm[n_a:])
+        signs = rng.choice((-1.0, 1.0), size=n_paired)
+        null[i] = np.mean(differences * signs)
     p_value = float((np.sum(np.abs(null) >= abs(observed)) + 1) / (len(null) + 1))
 
     auc_a = float(np.sum(arr_a))
     auc_b = float(np.sum(arr_b))
-    sd = float(np.std(pooled, ddof=1)) if len(pooled) > 1 else 0.0
+    sd = float(np.std(differences, ddof=1)) if n_paired > 1 else 0.0
     effect = float(observed / sd) if sd > 0 else np.nan
     log2_ratio = float(np.log2((auc_a + eps) / (auc_b + eps)))
     direction = "higher_a" if observed > 0 else "higher_b" if observed < 0 else "flat"
+    significant = bool(
+        p_value <= float(significance_level)
+        and abs(log2_ratio) >= float(log2fc_threshold)
+    )
+    change_call = direction if significant else "not_significant"
 
     return {
-        "test": "binned_permutation",
+        "test": "paired_binned_sign_flip",
         "bin_size": int(resolved_bin_size),
         "bin_size_mode": "auto" if isinstance(bin_size, str) else "fixed",
         "n_permutations": int(n_permutations),
-        "n_bins_a": int(len(a)),
-        "n_bins_b": int(len(b)),
+        "n_bins_a": int(n_paired),
+        "n_bins_b": int(n_paired),
         "mean_a": float(np.mean(a)),
         "mean_b": float(np.mean(b)),
         "mean_diff": observed,
@@ -150,6 +163,10 @@ def binned_permutation_test(signal_a, signal_b, bin_size="auto",
         "log2_auc_ratio": log2_ratio,
         "effect_size": effect,
         "p_value": p_value,
+        "significance_level": float(significance_level),
+        "log2fc_threshold": float(log2fc_threshold),
+        "significant": significant,
+        "change_call": change_call,
         "direction": direction,
         "interpretation": "raw_observed_difference",
     }
@@ -157,7 +174,9 @@ def binned_permutation_test(signal_a, signal_b, bin_size="auto",
 
 def pairwise_binned_permutation_tests(signals_by_sample, bin_size="auto",
                                       n_permutations=200, random_state=0,
-                                      region_name=None):
+                                      region_name=None,
+                                      significance_level=0.10,
+                                      log2fc_threshold=0.25):
     rows = []
     for i, (sample_a, sample_b) in enumerate(combinations(signals_by_sample.keys(), 2)):
         result = binned_permutation_test(
@@ -167,6 +186,8 @@ def pairwise_binned_permutation_tests(signals_by_sample, bin_size="auto",
             n_permutations=n_permutations,
             random_state=random_state + i,
             region_name=region_name,
+            significance_level=significance_level,
+            log2fc_threshold=log2fc_threshold,
         )
         result["sample_a"] = sample_a
         result["sample_b"] = sample_b
@@ -264,7 +285,7 @@ def compute_global_thresholds(catalog_df, sample_names_atac, sample_names_rna,
 # ============================================================
 
 def classify_direction(promoter_atac_lfc, genebody_atac_lfc, rna_lfc,
-                       lfc_threshold=0.5):
+                       lfc_threshold=0.25):
     """
     基于三个 log2FC 综合判断 ATAC/RNA 变化方向。
     
@@ -379,7 +400,7 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
         (ax_atac_body, atac_genebody_raw, "Gene body ATAC (raw)", "raw ATAC"),
     ]
     if has_rna:
-        panels.append((ax_rna_body, rna_raw, "Gene body RNA (raw)", "raw RNA"))
+        panels.append((ax_rna_body, rna_raw, "RNA merged exons (raw)", "raw RNA"))
     
     for ax, data, title, ylabel in panels:
         if data:
@@ -397,7 +418,7 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
     
     ax_atac_body.set_xlabel("Position in gene body (bp)")
     if ax_rna_body is not None:
-        ax_rna_body.set_xlabel("Position in gene body (bp)")
+        ax_rna_body.set_xlabel("Position in merged exons (bp)")
     
     fig.suptitle(f"{gene_name}  {title_suffix}", fontsize=12, y=1.005)
     fig.savefig(output_png, dpi=130, bbox_inches="tight")
@@ -432,8 +453,14 @@ def plot_pca_2d(matrix_df, output_png, title="PCA"):
 # ============================================================
 
 def resolve_genes(gtf_file, genes=None, gene_file=None,
-                  promoter_upstream=200, promoter_downstream=200):
-    from .read import GTFFullReader, GTFQueryReader
+                  promoter_upstream=200, promoter_downstream=200,
+                  include_exons=False):
+    from .read import (
+        GTFFullReader,
+        GTFQueryReader,
+        attach_exon_intervals,
+        query_genes_with_exons,
+    )
     
     items = []
     if gene_file:
@@ -443,8 +470,12 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
         items += [genes] if isinstance(genes, (str, int)) else list(genes)
     
     if not items:
-        return GTFFullReader(gtf_file, promoter_upstream=promoter_upstream,
-                              promoter_downstream=promoter_downstream).read()
+        result = GTFFullReader(
+            gtf_file,
+            promoter_upstream=promoter_upstream,
+            promoter_downstream=promoter_downstream,
+        ).read()
+        return attach_exon_intervals(gtf_file, result) if include_exons else result
     
     names, indices = [], []
     for it in items:
@@ -455,12 +486,27 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
     
     parts = []
     if names:
-        parts.append(GTFQueryReader(gtf_file, queries=names,
-                                     promoter_upstream=promoter_upstream,
-                                     promoter_downstream=promoter_downstream).read())
+        if include_exons:
+            parts.append(query_genes_with_exons(
+                gtf_file,
+                queries=names,
+                promoter_upstream=promoter_upstream,
+                promoter_downstream=promoter_downstream,
+            ))
+        else:
+            parts.append(GTFQueryReader(
+                gtf_file,
+                queries=names,
+                promoter_upstream=promoter_upstream,
+                promoter_downstream=promoter_downstream,
+            ).read())
     if indices:
         all_df = GTFFullReader(gtf_file, promoter_upstream=promoter_upstream,
                                 promoter_downstream=promoter_downstream).read()
-        parts.append(all_df.iloc[indices])
+        selected = all_df.iloc[indices]
+        parts.append(
+            attach_exon_intervals(gtf_file, selected)
+            if include_exons else selected
+        )
     
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["gene_id"])
