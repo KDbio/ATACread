@@ -1,6 +1,9 @@
 import re
 import os
 import gzip
+import json
+import hashlib
+import sqlite3
 import pandas as pd
 import numpy as np
 import scipy
@@ -50,6 +53,7 @@ class GTFReader:
 
     # 用正则匹配 key "value" 这种模式
     ATTR_PATTERN = re.compile(r'(\S+)\s+"([^"]+)"')
+    GENE_ID_PATTERN = re.compile(r'(?:^|;)\s*gene_id\s+"([^"]+)"')
 
     def __init__(
         self,
@@ -324,10 +328,10 @@ def attach_exon_intervals(gtf_file, gene_df):
                 continue
             if cols[2] not in {"gene", "exon"}:
                 continue
-            attrs = GTFReader.parse_attributes(cols[8])
-            gene_id = attrs.get("gene_id")
-            if gene_id is None:
+            match = GTFReader.GENE_ID_PATTERN.search(cols[8])
+            if match is None:
                 continue
+            gene_id = match.group(1)
             gene_id_base = gene_id.split(".")[0]
 
             # GENCODE groups a gene row and its child records together. Once
@@ -411,8 +415,8 @@ def query_genes_with_exons(gtf_file, queries, promoter_upstream=200,
 
             if cols[2] != "exon" or active_record is None:
                 continue
-            attrs = GTFReader.parse_attributes(cols[8])
-            exon_gene = attrs.get("gene_id", "").split(".")[0]
+            match = GTFReader.GENE_ID_PATTERN.search(cols[8])
+            exon_gene = match.group(1).split(".")[0] if match else ""
             if exon_gene == active_record["gene_id_base"]:
                 active_intervals.append((int(cols[3]) - 1, int(cols[4])))
 
@@ -431,6 +435,218 @@ def query_genes_with_exons(gtf_file, queries, promoter_upstream=200,
             for query in missing:
                 print(f"  - {query}")
     return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+class GTFAnnotationCache:
+    """Persistent SQLite index for gene records and merged exon intervals."""
+
+    SCHEMA_VERSION = "1"
+
+    def __init__(self, gtf_file, cache_file=None):
+        self.gtf_file = os.path.abspath(os.fspath(gtf_file))
+        self.cache_file = (
+            os.path.abspath(os.fspath(cache_file))
+            if cache_file else self._default_cache_path()
+        )
+
+    def _default_cache_path(self):
+        adjacent = self.gtf_file + ".atacread.sqlite"
+        parent = os.path.dirname(adjacent) or "."
+        if os.access(parent, os.W_OK):
+            return adjacent
+        stat = os.stat(self.gtf_file)
+        identity = f"{self.gtf_file}|{stat.st_size}|{stat.st_mtime_ns}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "atacread")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"gtf-{digest}.sqlite")
+
+    def _source_metadata(self):
+        stat = os.stat(self.gtf_file)
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "source_size": str(stat.st_size),
+            "source_mtime_ns": str(stat.st_mtime_ns),
+        }
+
+    def is_valid(self):
+        if not os.path.exists(self.cache_file):
+            return False
+        try:
+            with sqlite3.connect(self.cache_file) as conn:
+                rows = conn.execute("SELECT key, value FROM metadata").fetchall()
+            return dict(rows) == self._source_metadata()
+        except (sqlite3.Error, OSError):
+            return False
+
+    @staticmethod
+    def _record_with_promoter(record, upstream, downstream):
+        record = dict(record)
+        start, end = int(record["start"]), int(record["end"])
+        strand = record.get("strand", "+")
+        tss = start if strand != "-" else end
+        if strand == "-":
+            promoter_start = tss - int(downstream)
+            promoter_end = tss + int(upstream)
+        else:
+            promoter_start = tss - int(upstream)
+            promoter_end = tss + int(downstream)
+        record["tss"] = tss
+        record["promoter_start"] = max(0, promoter_start)
+        record["promoter_end"] = promoter_end
+        return record
+
+    def build(self, force=False):
+        if not force and self.is_valid():
+            return self.cache_file
+
+        os.makedirs(os.path.dirname(self.cache_file) or ".", exist_ok=True)
+        tmp_file = f"{self.cache_file}.tmp-{os.getpid()}"
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+
+        print(f"[gtf-cache] 创建索引: {self.cache_file}")
+        parser = GTFReader(self.gtf_file)
+        conn = sqlite3.connect(tmp_file)
+        current_record = None
+        exon_intervals = []
+        gene_index = 0
+
+        def finish_gene():
+            nonlocal current_record, exon_intervals, gene_index
+            if current_record is None:
+                return
+            merged = _merge_intervals(exon_intervals)
+            exon_length = int(sum(end - start for start, end in merged))
+            conn.execute(
+                """INSERT INTO genes
+                   (gene_index, gene_id, gene_id_base, gene_name,
+                    record_json, exon_json, exon_length)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    gene_index,
+                    current_record["gene_id"],
+                    current_record["gene_id_base"],
+                    current_record["gene_name"],
+                    json.dumps(current_record, ensure_ascii=False),
+                    json.dumps(merged),
+                    exon_length,
+                ),
+            )
+            gene_index += 1
+            if gene_index % 10000 == 0:
+                conn.commit()
+                print(f"[gtf-cache] 已索引 {gene_index} 个基因")
+            current_record = None
+            exon_intervals = []
+
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE genes (
+                    gene_index INTEGER PRIMARY KEY,
+                    gene_id TEXT NOT NULL,
+                    gene_id_base TEXT NOT NULL,
+                    gene_name TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    exon_json TEXT NOT NULL,
+                    exon_length INTEGER NOT NULL
+                );
+                """
+            )
+            with _open_text_auto(self.gtf_file) as gtf:
+                for line in gtf:
+                    if not line or line.startswith("#"):
+                        continue
+                    cols = line.rstrip("\n").split("\t")
+                    if len(cols) != 9:
+                        continue
+                    if cols[2] == "gene":
+                        finish_gene()
+                        current_record = parser._parse_line(line)
+                    elif cols[2] == "exon" and current_record is not None:
+                        match = GTFReader.GENE_ID_PATTERN.search(cols[8])
+                        exon_gene = match.group(1).split(".")[0] if match else ""
+                        if exon_gene == current_record["gene_id_base"]:
+                            exon_intervals.append((int(cols[3]) - 1, int(cols[4])))
+            finish_gene()
+            conn.executemany(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                self._source_metadata().items(),
+            )
+            conn.executescript(
+                """
+                CREATE INDEX genes_gene_id_idx ON genes(gene_id);
+                CREATE INDEX genes_gene_id_base_idx ON genes(gene_id_base);
+                CREATE INDEX genes_gene_name_idx ON genes(gene_name);
+                """
+            )
+            conn.commit()
+        except Exception:
+            conn.close()
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+            raise
+        else:
+            conn.close()
+
+        os.replace(tmp_file, self.cache_file)
+        print(f"[gtf-cache] 完成: {gene_index} 个基因")
+        return self.cache_file
+
+    def _deserialize(self, row, upstream, downstream, query=None):
+        record = json.loads(row[0])
+        record["exon_intervals"] = [tuple(interval) for interval in json.loads(row[1])]
+        record["exon_length"] = int(row[2])
+        record["gene_index"] = int(row[3])
+        if query is not None:
+            record["query"] = query
+        return self._record_with_promoter(record, upstream, downstream)
+
+    def read(self, queries=None, indices=None, promoter_upstream=200,
+             promoter_downstream=200):
+        self.build()
+        records = []
+        with sqlite3.connect(self.cache_file) as conn:
+            if queries:
+                for query in queries:
+                    query = str(query).strip()
+                    query_base = query.split(".")[0]
+                    rows = conn.execute(
+                        """SELECT record_json, exon_json, exon_length, gene_index
+                           FROM genes
+                           WHERE gene_name = ? OR gene_id = ? OR gene_id_base = ?
+                           ORDER BY gene_index""",
+                        (query, query, query_base),
+                    ).fetchall()
+                    records.extend(
+                        self._deserialize(
+                            row, promoter_upstream, promoter_downstream, query=query
+                        )
+                        for row in rows
+                    )
+            elif indices:
+                for index in indices:
+                    row = conn.execute(
+                        """SELECT record_json, exon_json, exon_length, gene_index
+                           FROM genes WHERE gene_index = ?""",
+                        (int(index),),
+                    ).fetchone()
+                    if row is not None:
+                        records.append(self._deserialize(
+                            row, promoter_upstream, promoter_downstream
+                        ))
+            else:
+                rows = conn.execute(
+                    """SELECT record_json, exon_json, exon_length, gene_index
+                       FROM genes ORDER BY gene_index"""
+                )
+                records.extend(
+                    self._deserialize(row, promoter_upstream, promoter_downstream)
+                    for row in rows
+                )
+        return pd.DataFrame(records) if records else pd.DataFrame()
 
 
 # ============================================================

@@ -195,6 +195,54 @@ def pairwise_binned_permutation_tests(signals_by_sample, bin_size="auto",
     return pd.DataFrame(rows)
 
 
+def overall_deviation_tests(signals_by_sample, bin_size="auto",
+                            n_permutations=200, random_state=0,
+                            region_name=None, significance_level=0.10,
+                            log2fc_threshold=0.25):
+    """
+    Test each profile against the pointwise median of all profiles.
+
+    The group median is robust to a minority of strong outliers and avoids the
+    unstable two-profile reference produced by leave-one-out testing when only
+    three samples are available. With two samples only the pairwise test is
+    defined.
+    """
+    names = list(signals_by_sample)
+    if len(names) < 3:
+        return pd.DataFrame()
+
+    arrays = {name: to_array(signals_by_sample[name]) for name in names}
+    common_length = min((len(values) for values in arrays.values()), default=0)
+    if common_length == 0:
+        return pd.DataFrame()
+    arrays = {name: values[:common_length] for name, values in arrays.items()}
+    group_reference = np.median(np.vstack(list(arrays.values())), axis=0)
+
+    rows = []
+    for index, sample in enumerate(names):
+        result = binned_permutation_test(
+            arrays[sample],
+            group_reference,
+            bin_size=bin_size,
+            n_permutations=n_permutations,
+            random_state=random_state + index,
+            region_name=region_name,
+            significance_level=significance_level,
+            log2fc_threshold=log2fc_threshold,
+        )
+        result["sample_id"] = index + 1
+        result["sample"] = sample
+        result["reference"] = "group_pointwise_median"
+        result["is_deviant"] = bool(result["significant"])
+        result["deviation_call"] = (
+            "higher_than_group" if result["is_deviant"] and result["mean_diff"] > 0
+            else "lower_than_group" if result["is_deviant"] and result["mean_diff"] < 0
+            else "not_deviant"
+        )
+        rows.append(result)
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # 离群检测
 # ============================================================
@@ -367,11 +415,98 @@ def _add_promoter_sequence_axis(ax, promoter_seq, max_len=400):
     ax.set_xlabel("Promoter sequence (gene-strand, 5' to 3')", fontsize=8)
 
 
+def _comparison_items(results):
+    if results is None:
+        return []
+    if isinstance(results, pd.DataFrame):
+        rows = results.to_dict(orient="records")
+    else:
+        rows = list(results)
+    items = []
+    for index, row in enumerate(rows, start=1):
+        comparison_id = row.get("comparison_id", index)
+        sample_a = _short_sample_name(row.get("sample_a", "A"))
+        sample_b = _short_sample_name(row.get("sample_b", "B"))
+        call = "YES" if bool(row.get("significant", False)) else "NO"
+        items.append(f"{comparison_id} {sample_a} vs {sample_b}: {call}")
+    return items
+
+
+def _short_sample_name(value, max_length=18):
+    value = str(value)
+    return value if len(value) <= max_length else value[:max_length - 3] + "..."
+
+
+def _deviation_items(results):
+    if results is None:
+        return []
+    if isinstance(results, pd.DataFrame):
+        rows = results.to_dict(orient="records")
+    else:
+        rows = list(results)
+    items = []
+    for index, row in enumerate(rows, start=1):
+        sample_id = row.get("sample_id", index)
+        sample = _short_sample_name(row.get("sample", f"sample{sample_id}"))
+        call = "YES" if bool(row.get("is_deviant", False)) else "NO"
+        items.append(f"{sample_id} {sample}: {call}")
+    return items
+
+
+def _add_result_summary(ax, title, items, y=-0.20):
+    if not items:
+        return y
+    lines = []
+    current = []
+    current_length = 0
+    for item in items:
+        added = len(item) + (3 if current else 0)
+        if current and current_length + added > 78:
+            lines.append(" | ".join(current))
+            current = [item]
+            current_length = len(item)
+        else:
+            current.append(item)
+            current_length += added
+    if current:
+        lines.append(" | ".join(current))
+    ax.text(
+        0.0,
+        y,
+        title + "  " + "\n".join(lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7,
+        color="#333333",
+        clip_on=False,
+    )
+    return y - 0.08 * len(lines)
+
+
+def _add_panel_statistics(ax, pairwise_results=None, deviation_results=None,
+                          y=-0.20):
+    y = _add_result_summary(
+        ax,
+        "Overall deviation",
+        _deviation_items(deviation_results),
+        y=y,
+    )
+    _add_result_summary(
+        ax,
+        "Pairwise significance",
+        _comparison_items(pairwise_results),
+        y=y,
+    )
+
+
 def plot_gene_signals(gene_name, atac_promoter_raw,
                       atac_genebody_raw,
                       rna_raw,
                       output_png, title_suffix="", promoter_seq=None,
-                      promoter_seq_max_len=400):
+                      promoter_seq_max_len=400,
+                      comparison_results=None,
+                      deviation_results=None):
     """
     每个基因整合图：
         Left:  promoter ATAC raw
@@ -381,16 +516,33 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
         promoter_seq is not None
         and 0 < len(str(promoter_seq)) <= promoter_seq_max_len
     )
-    fig_height = 7.2 if show_promoter_seq else 6.8
+    comparison_results = comparison_results or {}
+    deviation_results = deviation_results or {}
+    max_comparisons = max(
+        (len(_comparison_items(value)) for value in comparison_results.values()),
+        default=0,
+    )
+    max_deviations = max(
+        (len(_deviation_items(value)) for value in deviation_results.values()),
+        default=0,
+    )
+    comparison_rows = int(np.ceil(max_comparisons / 3)) if max_comparisons else 0
+    deviation_rows = int(np.ceil(max_deviations / 3)) if max_deviations else 0
+    result_rows = comparison_rows + deviation_rows
+    fig_height = (7.2 if show_promoter_seq else 6.8) + min(2.5, result_rows * 0.28)
+    has_rna = bool(rna_raw)
     fig = plt.figure(figsize=(15, fig_height))
     grid = fig.add_gridspec(
         2, 2,
         width_ratios=[1.05, 1.35],
         height_ratios=[1.0, 1.0],
         wspace=0.18,
-        hspace=0.34 if show_promoter_seq else 0.26,
+        hspace=(
+            min(1.2, 0.34 + result_rows * 0.10)
+            if result_rows and has_rna
+            else (0.34 if show_promoter_seq else 0.26)
+        ),
     )
-    has_rna = bool(rna_raw)
     ax_promoter = fig.add_subplot(grid[:, 0])
     ax_atac_body = fig.add_subplot(grid[0, 1] if has_rna else grid[:, 1])
     ax_rna_body = fig.add_subplot(grid[1, 1]) if has_rna else None
@@ -419,6 +571,26 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
     ax_atac_body.set_xlabel("Position in gene body (bp)")
     if ax_rna_body is not None:
         ax_rna_body.set_xlabel("Position in merged exons (bp)")
+
+    _add_panel_statistics(
+        ax_promoter,
+        pairwise_results=comparison_results.get("atac_promoter"),
+        deviation_results=deviation_results.get("atac_promoter"),
+        y=-0.22 if show_promoter_seq else -0.16,
+    )
+    _add_panel_statistics(
+        ax_atac_body,
+        pairwise_results=comparison_results.get("atac_genebody"),
+        deviation_results=deviation_results.get("atac_genebody"),
+        y=-0.18,
+    )
+    if ax_rna_body is not None:
+        _add_panel_statistics(
+            ax_rna_body,
+            pairwise_results=comparison_results.get("rna"),
+            deviation_results=deviation_results.get("rna"),
+            y=-0.18,
+        )
     
     fig.suptitle(f"{gene_name}  {title_suffix}", fontsize=12, y=1.005)
     fig.savefig(output_png, dpi=130, bbox_inches="tight")
@@ -458,9 +630,10 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
     from .read import (
         GTFFullReader,
         GTFQueryReader,
-        attach_exon_intervals,
-        query_genes_with_exons,
+        GTFAnnotationCache,
     )
+    cache = GTFAnnotationCache(gtf_file)
+    use_cache = include_exons or cache.is_valid()
     
     items = []
     if gene_file:
@@ -470,6 +643,11 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
         items += [genes] if isinstance(genes, (str, int)) else list(genes)
     
     if not items:
+        if use_cache:
+            return cache.read(
+                promoter_upstream=promoter_upstream,
+                promoter_downstream=promoter_downstream,
+            )
         result = GTFFullReader(
             gtf_file,
             promoter_upstream=promoter_upstream,
@@ -486,9 +664,8 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
     
     parts = []
     if names:
-        if include_exons:
-            parts.append(query_genes_with_exons(
-                gtf_file,
+        if use_cache:
+            parts.append(cache.read(
                 queries=names,
                 promoter_upstream=promoter_upstream,
                 promoter_downstream=promoter_downstream,
@@ -501,12 +678,18 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
                 promoter_downstream=promoter_downstream,
             ).read())
     if indices:
-        all_df = GTFFullReader(gtf_file, promoter_upstream=promoter_upstream,
-                                promoter_downstream=promoter_downstream).read()
-        selected = all_df.iloc[indices]
-        parts.append(
-            attach_exon_intervals(gtf_file, selected)
-            if include_exons else selected
-        )
+        if use_cache:
+            parts.append(cache.read(
+                indices=indices,
+                promoter_upstream=promoter_upstream,
+                promoter_downstream=promoter_downstream,
+            ))
+        else:
+            all_df = GTFFullReader(
+                gtf_file,
+                promoter_upstream=promoter_upstream,
+                promoter_downstream=promoter_downstream,
+            ).read()
+            parts.append(all_df.iloc[indices])
     
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["gene_id"])

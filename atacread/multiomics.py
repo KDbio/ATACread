@@ -8,6 +8,7 @@ from .signal_utils import (
     detect_outliers, classify_gene_state, classify_direction,
     compute_global_thresholds, plot_gene_signals, plot_pca_2d,
     resolve_genes, pairwise_binned_permutation_tests,
+    overall_deviation_tests,
 )
 
 
@@ -209,6 +210,7 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
 
     outlier_rows = []
     test_rows = []
+    deviation_rows = []
     plots = []
     
     for _, r in features.iterrows():
@@ -222,11 +224,13 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
         atac_p_raw = collect("atac", atac_names, "promoter") if atac_names else {}
         atac_g_raw = collect("atac", atac_names, "gene_body") if atac_names else {}
         rna_raw = collect("rna", rna_names, "gene_body") if rna_names else {}
+        panel_comparisons = {}
+        panel_deviations = {}
         
-        for label, signals in [
-            ("ATAC_promoter", atac_p_raw),
-            ("ATAC_genebody", atac_g_raw),
-            ("RNA_merged_exons", rna_raw),
+        for label, panel_key, signals in [
+            ("ATAC_promoter", "atac_promoter", atac_p_raw),
+            ("ATAC_genebody", "atac_genebody", atac_g_raw),
+            ("RNA_merged_exons", "rna", rna_raw),
         ]:
             if len(signals) >= 3:
                 odf = detect_outliers(signals, z_threshold=outlier_z)
@@ -235,6 +239,21 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                 odf["region"] = label
                 odf["scale"] = "raw"
                 outlier_rows.append(odf)
+                ddf = overall_deviation_tests(
+                    signals,
+                    bin_size=bin_size,
+                    n_permutations=n_permutations,
+                    region_name=label,
+                    significance_level=significance_level,
+                    log2fc_threshold=lfc_threshold,
+                )
+                if not ddf.empty:
+                    ddf["gene_id"] = gid
+                    ddf["gene_name"] = gname
+                    ddf["region"] = label
+                    ddf["scale"] = "raw"
+                    deviation_rows.append(ddf)
+                    panel_deviations[panel_key] = ddf
             if len(signals) >= 2:
                 tdf = pairwise_binned_permutation_tests(
                     signals,
@@ -245,11 +264,13 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                     log2fc_threshold=lfc_threshold,
                 )
                 if not tdf.empty:
+                    tdf.insert(0, "comparison_id", range(1, len(tdf) + 1))
                     tdf["gene_id"] = gid
                     tdf["gene_name"] = gname
                     tdf["region"] = label
                     tdf["scale"] = "raw"
                     test_rows.append(tdf)
+                    panel_comparisons[panel_key] = tdf
         
         # 绘图
         if atac_p_raw or rna_raw:
@@ -262,6 +283,8 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
                 png,
                 title_suffix=f"({r.get('chrom')}, {r.get('strand')})",
                 promoter_seq=r.get("promoter_seq"),
+                comparison_results=panel_comparisons,
+                deviation_results=panel_deviations,
             )
             plots.append(png)
     
@@ -276,9 +299,22 @@ def run_profile(gtf_file, fasta_file, atac_files=None, rna_files=None,
         pd.concat(test_rows, ignore_index=True).to_csv(test_csv, index=False, encoding="utf-8-sig")
     else:
         pd.DataFrame().to_csv(test_csv, index=False, encoding="utf-8-sig")
+
+    deviation_csv = os.path.join(output_dir, "overall_deviation_tests.csv")
+    if deviation_rows:
+        pd.concat(deviation_rows, ignore_index=True).to_csv(
+            deviation_csv, index=False, encoding="utf-8-sig"
+        )
+    else:
+        pd.DataFrame().to_csv(deviation_csv, index=False, encoding="utf-8-sig")
     
     print(f"[profile] {len(plots)} 张图 | outliers: {outlier_csv} | tests: {test_csv}")
-    return {"plots": plots, "outlier_csv": outlier_csv, "test_csv": test_csv}
+    return {
+        "plots": plots,
+        "outlier_csv": outlier_csv,
+        "test_csv": test_csv,
+        "deviation_csv": deviation_csv,
+    }
 
 
 # ============================================================
@@ -458,6 +494,7 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
     summary_rows = []
     outlier_rows = []
     test_rows = []
+    deviation_rows = []
     per_base_rows = []
     plot_files = []
 
@@ -509,11 +546,13 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
         atac_p_raw = collect("atac", atac_names, "promoter") if atac_names else {}
         atac_g_raw = collect("atac", atac_names, "gene_body") if atac_names else {}
         rna_raw = collect("rna", rna_names, "gene_body") if rna_names else {}
+        panel_comparisons = {}
+        panel_deviations = {}
 
-        for label, signals in [
-            ("ATAC_promoter", atac_p_raw),
-            ("ATAC_genebody", atac_g_raw),
-            ("RNA_merged_exons", rna_raw),
+        for label, panel_key, signals in [
+            ("ATAC_promoter", "atac_promoter", atac_p_raw),
+            ("ATAC_genebody", "atac_genebody", atac_g_raw),
+            ("RNA_merged_exons", "rna", rna_raw),
         ]:
             if len(signals) >= 3:
                 odf = detect_outliers(signals, z_threshold=outlier_z)
@@ -522,6 +561,21 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                 odf["region"] = label
                 odf["scale"] = "raw"
                 outlier_rows.append(odf)
+                ddf = overall_deviation_tests(
+                    signals,
+                    bin_size=bin_size,
+                    n_permutations=n_permutations,
+                    region_name=label,
+                    significance_level=significance_level,
+                    log2fc_threshold=lfc_threshold,
+                )
+                if not ddf.empty:
+                    ddf["gene_id"] = gene_id
+                    ddf["gene_name"] = gene_name
+                    ddf["region"] = label
+                    ddf["scale"] = "raw"
+                    deviation_rows.append(ddf)
+                    panel_deviations[panel_key] = ddf
             if len(signals) >= 2:
                 tdf = pairwise_binned_permutation_tests(
                     signals,
@@ -532,11 +586,13 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                     log2fc_threshold=lfc_threshold,
                 )
                 if not tdf.empty:
+                    tdf.insert(0, "comparison_id", range(1, len(tdf) + 1))
                     tdf["gene_id"] = gene_id
                     tdf["gene_name"] = gene_name
                     tdf["region"] = label
                     tdf["scale"] = "raw"
                     test_rows.append(tdf)
+                    panel_comparisons[panel_key] = tdf
 
         if make_plots and i < plot_first_n:
             png = os.path.join(output_dir, f"{gene_name}_signals.png")
@@ -548,6 +604,8 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
                 png,
                 title_suffix=f"({r.get('chrom')}, {r.get('strand')})",
                 promoter_seq=r.get("promoter_seq"),
+                comparison_results=panel_comparisons,
+                deviation_results=panel_deviations,
             )
             plot_files.append(png)
 
@@ -569,6 +627,14 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
     else:
         pd.DataFrame().to_csv(test_csv, index=False, encoding="utf-8-sig")
 
+    deviation_csv = os.path.join(output_dir, "overall_deviation_tests.csv")
+    if deviation_rows:
+        pd.concat(deviation_rows, ignore_index=True).to_csv(
+            deviation_csv, index=False, encoding="utf-8-sig"
+        )
+    else:
+        pd.DataFrame().to_csv(deviation_csv, index=False, encoding="utf-8-sig")
+
     per_base_csv = None
     if save_per_base:
         per_base_csv = os.path.join(output_dir, "per_base_values.csv")
@@ -579,6 +645,7 @@ def extract_multiomics_features(gtf_file, fasta_file, atac_files=None, rna_files
         "summary_csv": summary_csv,
         "outlier_csv": outlier_csv,
         "test_csv": test_csv,
+        "deviation_csv": deviation_csv,
         "per_base_csv": per_base_csv,
         "plot_files": plot_files,
         "features": features,

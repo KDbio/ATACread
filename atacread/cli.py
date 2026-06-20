@@ -55,7 +55,10 @@ def main(argv=None):
         prog="atacread",
         description="ATAC/RNA bigWig reading, gene-region summaries, plots, and raw-signal tests.",
     )
-    parser.add_argument("mode", choices=["catalog", "profile", "paired", "bam", "deseq2"])
+    parser.add_argument(
+        "mode",
+        choices=["catalog", "profile", "paired", "bam", "deseq2", "gtf-index"],
+    )
     parser.add_argument("-w", "--work-dir", default=".", help="Folder used for automatic file discovery.")
     parser.add_argument("-o", "--output-dir", default=None, help="Output folder.")
     parser.add_argument("-g", "--genes", default=None, help="Comma-separated gene names, gene IDs, or gene indices.")
@@ -77,6 +80,8 @@ def main(argv=None):
                         help="Minimum absolute log2 fold change (default: 0.25).")
     parser.add_argument("--pca", action="store_true", help="Run RNA PCA in paired mode.")
     parser.add_argument("--no-classify", action="store_true", help="Do not classify gene states in catalog mode.")
+    parser.add_argument("--rebuild-gtf-cache", action="store_true",
+                        help="Force rebuilding the GTF SQLite index.")
 
     parser.add_argument("--bam", default=None, help="Comma-separated BAM files for BAM mode.")
     parser.add_argument("--regions", default=None, help="BED regions for BAM counting.")
@@ -100,6 +105,19 @@ def main(argv=None):
     genes = _split_csv(args.genes)
     atac_names = _split_csv(args.atac_names)
     rna_names = _split_csv(args.rna_names)
+
+    if args.mode == "gtf-index":
+        from .read import GTFAnnotationCache
+
+        gtf = args.gtf
+        if not gtf:
+            candidates = auto_find(args.work_dir, [".gtf", ".gtf.gz"])
+            gtf = candidates[0] if candidates else None
+        if not gtf:
+            raise ValueError("gtf-index mode requires --gtf or a GTF in --work-dir")
+        cache = GTFAnnotationCache(gtf)
+        print(cache.build(force=args.rebuild_gtf_cache))
+        return
 
     if args.mode == "bam":
         bams = _split_csv(args.bam) if args.bam else auto_find(args.work_dir, [".bam"])

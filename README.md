@@ -9,6 +9,22 @@ signal comparisons use a paired binned sign-flip test and report p-values plus
 effect sizes. Exploratory defaults are `p <= 0.10` and
 `abs(log2 fold change) >= 0.25`.
 
+For three or more tracks, each sample is also tested against the pointwise
+median profile of the group. Plot captions show both overall-deviation calls
+and numbered pairwise calls. Results are written to
+`overall_deviation_tests.csv` and `raw_permutation_tests.csv`.
+
+When RNA analysis first uses a GTF, ATACread creates a sidecar SQLite index
+named `<annotation.gtf>.atacread.sqlite`. The first build scans the annotation
+once; later gene-name, Ensembl-ID, and gene-index queries reuse the cache. It
+is rebuilt automatically when the source GTF size or modification time changes.
+
+The index can also be prepared before an analysis:
+
+```bash
+atacread gtf-index --gtf annotation.gtf
+```
+
 ## Installation
 
 ```bash
@@ -29,6 +45,7 @@ atacread profile   Multi-gene plots and raw-signal permutation tests
 atacread paired    Paired ATAC/RNA direction analysis
 atacread bam       BAM QC, fragment length, FRiP, TSS, counts, and bigWig
 atacread deseq2    PyDESeq2 analysis of an integer count matrix
+atacread gtf-index Build or validate the reusable GTF SQLite index
 ```
 
 Multiple genes can be supplied as a text file containing one gene name,

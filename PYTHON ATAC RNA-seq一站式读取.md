@@ -2127,3 +2127,41 @@ atacread profile \
 此时 `direction_analysis.csv` 的样本级 p 值会留空；仍可查看
 `raw_permutation_tests.csv` 的同一区域曲线差异，但它表示观察到的信号曲线不同，不能
 替代具有生物学重复的正式差异表达分析。
+
+### 16.GTF 索引与多轨道整体偏离判断
+
+原来的基因查询需要每次顺序遍历 GTF。对于 2.5 GB 左右的 GENCODE 注释，即使只查
+一个基因，也可能因为基因位于靠后的染色体而等待很久。现在第一次执行包含 RNA 的
+分析时，会在 GTF 旁边建立：
+
+```text
+annotation.gtf.atacread.sqlite
+```
+
+这个 SQLite 索引只依赖 Python 标准库，保存基因名称、Ensembl ID、GTF 顺序编号、
+基因坐标和合并后的外显子区间。第一次仍需完整扫描一次 GTF，但之后按名称、ID 或编号
+查询都直接访问索引。程序会比较原 GTF 的文件大小和修改时间，注释文件变化后自动
+重建；启动子上下游长度是在读取索引后重新计算的，因此修改启动子参数不会重建索引。
+
+也可以在正式分析前单独建立索引：
+
+```bash
+atacread gtf-index --gtf annotation.gtf
+```
+
+当同一区域有 3 条或更多轨道时，现在提供两层结果：
+
+1. **偏离整体**：每条轨道与所有轨道逐位置中位数形成的总体曲线比较。中位数不会被
+   少数极高或极低样本明显拉动，结果写入 `overall_deviation_tests.csv`；
+2. **两两比较**：继续保留所有样本组合，结果写入 `raw_permutation_tests.csv`。
+
+图片中每个 ATAC promoter、ATAC gene body 和 RNA exon 面板下方都会显示：
+
+```text
+Overall deviation  1 ATAC1: NO | 2 ATAC2: NO | 3 ATAC3: YES
+Pairwise significance  1 ATAC1 vs ATAC2: NO | 2 ATAC1 vs ATAC3: YES | ...
+```
+
+如果有 `n` 条轨道，两两比较数目为 `n(n-1)/2`。编号和 CSV 中的 `sample_id`、
+`comparison_id` 完全对应；项目仍保留连续的 p 值和变化倍数，图上的 YES/NO 只是按
+当前 `--significance-level` 与 `--lfc-threshold` 得到的便捷标记。
