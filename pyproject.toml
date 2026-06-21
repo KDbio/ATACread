@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ATACread"
-version = "0.5.0"
+version = "0.5.1"
 description = "ATAC/RNA bigWig analysis with BAM QC, FRiP, TSS enrichment, and count matrices."
 readme = "README.md"
 requires-python = ">=3.9"

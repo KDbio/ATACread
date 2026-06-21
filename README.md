@@ -13,6 +13,8 @@ For three or more tracks, each sample is also tested against the pointwise
 median profile of the group. Plot captions show both overall-deviation calls
 and numbered pairwise calls. Results are written to
 `overall_deviation_tests.csv` and `raw_permutation_tests.csv`.
+Pairwise calls are omitted from the figure when a panel contains more than
+three tracks, but all pairwise rows remain available in the CSV.
 
 When RNA analysis first uses a GTF, ATACread creates a sidecar SQLite index
 named `<annotation.gtf>.atacread.sqlite`. The first build scans the annotation

@@ -2166,6 +2166,10 @@ Pairwise significance  1 ATAC1 vs ATAC2: NO | 2 ATAC1 vs ATAC3: YES | ...
 `comparison_id` 完全对应；项目仍保留连续的 p 值和变化倍数，图上的 YES/NO 只是按
 当前 `--significance-level` 与 `--lfc-threshold` 得到的便捷标记。
 
+为了避免轨道较多时文字占据大片画布，当某个面板超过 3 条轨道时，图片只显示
+`Overall deviation`，不再显示 `Pairwise significance`。全部两两比较仍会照常计算并
+保存在 `raw_permutation_tests.csv`；2 条或 3 条轨道的面板仍显示两两比较文字。
+
 ### 17.FASTA 索引、指定转录本与 paired 数据复用
 
 FASTA 现在使用标准五列 `.fai` 索引。第一次读取 `genome.fa` 时会生成

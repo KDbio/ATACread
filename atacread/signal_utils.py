@@ -432,6 +432,23 @@ def _comparison_items(results):
     return items
 
 
+def _displayed_comparison_items(results, max_samples=3):
+    """Hide pairwise plot captions when a panel has too many tracks."""
+    if results is None:
+        return []
+    if isinstance(results, pd.DataFrame):
+        rows = results.to_dict(orient="records")
+    else:
+        rows = list(results)
+    samples = {
+        str(row.get(key))
+        for row in rows
+        for key in ("sample_a", "sample_b")
+        if row.get(key) is not None
+    }
+    return [] if len(samples) > int(max_samples) else _comparison_items(rows)
+
+
 def _short_sample_name(value, max_length=18):
     value = str(value)
     return value if len(value) <= max_length else value[:max_length - 3] + "..."
@@ -495,7 +512,7 @@ def _add_panel_statistics(ax, pairwise_results=None, deviation_results=None,
     _add_result_summary(
         ax,
         "Pairwise significance",
-        _comparison_items(pairwise_results),
+        _displayed_comparison_items(pairwise_results),
         y=y,
     )
 
@@ -519,7 +536,10 @@ def plot_gene_signals(gene_name, atac_promoter_raw,
     comparison_results = comparison_results or {}
     deviation_results = deviation_results or {}
     max_comparisons = max(
-        (len(_comparison_items(value)) for value in comparison_results.values()),
+        (
+            len(_displayed_comparison_items(value))
+            for value in comparison_results.values()
+        ),
         default=0,
     )
     max_deviations = max(

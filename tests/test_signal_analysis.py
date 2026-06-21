@@ -22,6 +22,7 @@ from atacread.read import (
 from atacread.signal_utils import (
     binned_permutation_test,
     _comparison_items,
+    _displayed_comparison_items,
     _deviation_items,
     overall_deviation_tests,
     plot_gene_signals,
@@ -65,6 +66,17 @@ class SignalStatisticsTest(unittest.TestCase):
             _comparison_items(results),
             ["1 A vs B: YES", "2 A vs C: NO", "3 B vs C: YES"],
         )
+        self.assertEqual(_displayed_comparison_items(results), _comparison_items(results))
+
+        four_sample_results = pd.DataFrame([
+            {"sample_a": "A", "sample_b": "B", "significant": False},
+            {"sample_a": "A", "sample_b": "C", "significant": False},
+            {"sample_a": "A", "sample_b": "D", "significant": True},
+            {"sample_a": "B", "sample_b": "C", "significant": False},
+            {"sample_a": "B", "sample_b": "D", "significant": True},
+            {"sample_a": "C", "sample_b": "D", "significant": True},
+        ])
+        self.assertEqual(_displayed_comparison_items(four_sample_results), [])
 
         deviation = overall_deviation_tests(
             {
