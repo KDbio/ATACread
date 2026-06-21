@@ -46,7 +46,34 @@ pip install "ATACread[all] @ git+https://github.com/KDbio/ATACread.git"
 
 ## Main commands
 
+### One-stop commands
+
+Most users only need a task name, one data folder, and target genes for the
+comparison task:
+
+```bash
+atacread auto --task bam --data data/bam_experiment
+atacread auto --task catalog --data data/bigwig_experiment
+atacread auto --task compare --data data/bigwig_experiment --genes POU5F1
+```
+
+The wrapper automatically discovers BAM, BED, metadata CSV, GTF, FASTA, ATAC
+bigWig, and RNA bigWig files. Direct children of the selected folder are
+preferred, which prevents unrelated nested datasets from being mixed. GTF and
+FASTA may be located in the selected folder or one of its first three parents.
+
+Hidden defaults include a 200 bp upstream/downstream promoter, automatic bins,
+200 permutations, `p <= 0.10`, `abs(log2FC) >= 0.25`, RNA exon union, BAM MAPQ
+30, 50 bp CPM bigWig bins, duplicate removal, and automatic BAM indexing.
+Output names are derived from the first ATAC bigWig stem, for example
+`sample_ATAC1.bigWig` becomes `output_sample_ATAC1_compare`. BAM mode uses the
+first BAM stem. PyDESeq2 runs only when a peak BED and compatible metadata CSV
+are both available.
+
+### Advanced commands
+
 ```text
+atacread auto      One-stop BAM, catalog, or comparison workflow
 atacread catalog   Full-GTF gene summary table
 atacread profile   Multi-gene plots and raw-signal permutation tests
 atacread paired    Paired ATAC/RNA direction analysis

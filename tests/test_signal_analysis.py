@@ -246,6 +246,77 @@ class PairedReuseTest(unittest.TestCase):
             self.assertEqual(build_features.call_count, 1)
 
 
+class AutoCliTest(unittest.TestCase):
+    def _write_reference_files(self, folder):
+        (folder / "genes.gtf").write_text("", encoding="utf-8")
+        (folder / "genome.fa").write_text(">chr1\nA\n", encoding="utf-8")
+
+    def test_auto_compare_discovers_files_and_output_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "experiment"
+            data.mkdir()
+            self._write_reference_files(root)
+            (data / "sample_ATAC1.bigWig").touch()
+            (data / "sample_ATAC2.bigWig").touch()
+            (data / "sample_RNA1.bigWig").touch()
+
+            with mock.patch("atacread.cli.run_profile") as run_profile:
+                cli_main([
+                    "auto", "--task", "compare", "--data", str(data),
+                    "--genes", "POU5F1",
+                ])
+
+            kwargs = run_profile.call_args.kwargs
+            self.assertEqual(kwargs["genes"], ["POU5F1"])
+            self.assertEqual(kwargs["output_dir"], "output_sample_ATAC1_compare")
+            self.assertEqual(len(kwargs["atac_files"]), 2)
+            self.assertEqual(len(kwargs["rna_files"]), 1)
+            self.assertEqual(kwargs["n_permutations"], 200)
+
+    def test_auto_catalog_uses_hidden_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            self._write_reference_files(data)
+            (data / "batch_ATAC.bigWig").touch()
+            (data / "batch_RNA.bigWig").touch()
+
+            with mock.patch("atacread.cli.run_catalog") as run_catalog:
+                cli_main(["auto", "--task", "catalog", "--data", str(data)])
+
+            kwargs = run_catalog.call_args.kwargs
+            self.assertEqual(kwargs["output_dir"], "output_batch_ATAC_catalog")
+            self.assertEqual(kwargs["promoter_upstream"], 200)
+            self.assertEqual(kwargs["promoter_downstream"], 200)
+
+    def test_auto_bam_runs_qc_and_bigwig_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "sample_ATAC.bam").touch()
+            (data / "consensus_peaks.bed").touch()
+            metadata = data / "metadata.csv"
+            metadata.write_text(
+                "sample,group\nsample_ATAC,control\n",
+                encoding="utf-8",
+            )
+            count_matrix = data / "count_matrix.csv"
+
+            with mock.patch(
+                "atacread.cli.run_bam_downstream",
+                return_value={"count_matrix_csv": str(count_matrix)},
+            ) as run_bam, mock.patch(
+                "atacread.cli.pydeseq2_differential"
+            ) as run_deseq2:
+                cli_main(["auto", "--task", "bam", "--data", str(data)])
+
+            kwargs = run_bam.call_args.kwargs
+            self.assertEqual(kwargs["output_dir"], "output_sample_ATAC_bam")
+            self.assertTrue(kwargs["make_bigwig"])
+            self.assertEqual(kwargs["bigwig_bin_size"], 50)
+            self.assertTrue(str(kwargs["regions_bed"]).endswith("consensus_peaks.bed"))
+            self.assertEqual(run_deseq2.call_args.kwargs["condition_col"], "group")
+
+
 @unittest.skipUnless(pyBigWig is not None, "requires pyBigWig")
 class RNAExonReaderTest(unittest.TestCase):
     def test_rna_reader_excludes_introns(self):

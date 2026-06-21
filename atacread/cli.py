@@ -2,6 +2,7 @@
 
 import argparse
 from pathlib import Path
+import pandas as pd
 
 from .multiomics import run_catalog, run_profile, run_paired
 from .bam_tools import run_bam_downstream, pydeseq2_differential
@@ -25,6 +26,158 @@ def auto_find(work_dir, suffixes, keywords=None):
             continue
         results.append(str(p))
     return sorted(results)
+
+
+def _find_data_files(data_dir, suffixes, keywords=None):
+    """Prefer direct children; recurse only when the folder has no matches."""
+    data_dir = Path(data_dir)
+
+    def matches(path):
+        name = path.name.lower()
+        if not any(name.endswith(suffix.lower()) for suffix in suffixes):
+            return False
+        return not keywords or any(keyword.lower() in name for keyword in keywords)
+
+    direct = sorted(str(path) for path in data_dir.iterdir() if path.is_file() and matches(path))
+    return direct or auto_find(data_dir, suffixes, keywords=keywords)
+
+
+def _find_reference_file(data_dir, suffixes):
+    """Find GTF/FASTA in the data folder or up to three parent folders."""
+    current = Path(data_dir).resolve()
+    for _ in range(4):
+        candidates = sorted(
+            str(path) for path in current.iterdir()
+            if path.is_file() and any(path.name.lower().endswith(s.lower()) for s in suffixes)
+        )
+        if candidates:
+            return candidates[0]
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def _automatic_output_dir(task, atac_files=None, bam_files=None):
+    sources = atac_files or bam_files or []
+    stem = Path(sources[0]).stem if sources else "atacread"
+    return f"output_{stem}_{task}"
+
+
+def run_auto_task(task, data_dir, genes=None, gene_file=None, output_dir=None):
+    """One-stop wrapper with conservative file discovery and stable defaults."""
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        raise NotADirectoryError(f"data 目录不存在: {data_dir}")
+
+    task = str(task).lower()
+    if task not in {"bam", "catalog", "compare"}:
+        raise ValueError("--task 必须是 bam、catalog 或 compare")
+
+    gtf = _find_reference_file(data_dir, [".gtf", ".gtf.gz"])
+    fasta = _find_reference_file(data_dir, [".fa", ".fasta", ".fna"])
+    atac = _find_data_files(data_dir, [".bw", ".bigwig"], keywords=["atac"])
+    rna = _find_data_files(data_dir, [".bw", ".bigwig"], keywords=["rna"])
+    bams = _find_data_files(data_dir, [".bam"])
+    output_dir = output_dir or _automatic_output_dir(
+        task,
+        atac_files=atac if task != "bam" else None,
+        bam_files=bams,
+    )
+
+    print(f"[auto] task   : {task}")
+    print(f"[auto] data   : {data_dir}")
+    print(f"[auto] output : {output_dir}")
+    print(f"[auto] ATAC/RNA/BAM: {len(atac)}/{len(rna)}/{len(bams)}")
+
+    if task == "bam":
+        if not bams:
+            raise FileNotFoundError(f"{data_dir} 中没有找到 BAM")
+        beds = _find_data_files(data_dir, [".bed", ".bed.gz"])
+        peak_beds = [
+            path for path in beds
+            if any(word in Path(path).name.lower() for word in ("peak", "region", "consensus"))
+        ]
+        regions = peak_beds[0] if peak_beds else (beds[0] if beds else None)
+        tss_beds = [path for path in beds if "tss" in Path(path).name.lower()]
+        tss_regions = gtf or (tss_beds[0] if tss_beds else None)
+        outputs = run_bam_downstream(
+            bams,
+            regions_bed=regions,
+            output_dir=output_dir,
+            min_mapq=30,
+            make_bigwig=True,
+            bigwig_bin_size=50,
+            tss_regions=tss_regions,
+            auto_index=True,
+            keep_duplicates=False,
+        )
+
+        metadata_candidates = _find_data_files(
+            data_dir,
+            [".csv"],
+            keywords=["metadata", "design", "sample"],
+        )
+        count_matrix = outputs.get("count_matrix_csv")
+        if count_matrix and metadata_candidates:
+            deseq_csv = str(Path(output_dir) / "pydeseq2_results.csv")
+            try:
+                metadata_columns = pd.read_csv(metadata_candidates[0], nrows=1).columns
+                condition_col = (
+                    "condition" if "condition" in metadata_columns
+                    else "group" if "group" in metadata_columns
+                    else "condition"
+                )
+                pydeseq2_differential(
+                    count_matrix,
+                    metadata_candidates[0],
+                    condition_col=condition_col,
+                    output_csv=deseq_csv,
+                )
+                outputs["deseq2_csv"] = deseq_csv
+            except (ValueError, ImportError) as exc:
+                print(f"[auto] 跳过差异分析: {exc}")
+        else:
+            print("[auto] 未同时找到 peak BED 和 metadata CSV，跳过 PyDESeq2")
+        return outputs
+
+    if not gtf or not fasta:
+        raise FileNotFoundError("catalog/compare 需要 data 目录或其父目录中存在 GTF 和 FASTA")
+    if not atac and not rna:
+        raise FileNotFoundError(f"{data_dir} 中没有找到 ATAC/RNA bigWig")
+
+    if task == "catalog":
+        return run_catalog(
+            gtf,
+            fasta,
+            atac_files=atac,
+            rna_files=rna,
+            output_dir=output_dir,
+            promoter_upstream=200,
+            promoter_downstream=200,
+        )
+
+    if not genes and not gene_file:
+        gene_files = _find_data_files(data_dir, [".txt"], keywords=["gene"])
+        gene_file = gene_files[0] if gene_files else None
+    if not genes and not gene_file:
+        raise ValueError("compare 需要 --genes 或 data 目录中的 gene*.txt")
+    return run_profile(
+        gtf,
+        fasta,
+        atac_files=atac,
+        rna_files=rna,
+        genes=genes,
+        gene_file=gene_file,
+        output_dir=output_dir,
+        promoter_upstream=200,
+        promoter_downstream=200,
+        bin_size="auto",
+        n_permutations=200,
+        significance_level=0.10,
+        lfc_threshold=0.25,
+        rna_region_mode="exon_union",
+    )
 
 
 def detect_inputs(work_dir, gtf=None, fasta=None, atac=None, rna=None):
@@ -53,16 +206,20 @@ def detect_inputs(work_dir, gtf=None, fasta=None, atac=None, rna=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="atacread",
-        description="ATAC/RNA bigWig reading, gene-region summaries, plots, and raw-signal tests.",
+        description="One-stop ATAC/RNA analysis plus advanced explicit modes.",
     )
     parser.add_argument(
         "mode",
         choices=[
             "catalog", "profile", "paired", "bam", "deseq2",
-            "gtf-index", "fasta-index",
+            "gtf-index", "fasta-index", "auto",
         ],
     )
     parser.add_argument("-w", "--work-dir", default=".", help="Folder used for automatic file discovery.")
+    parser.add_argument("--task", choices=["bam", "catalog", "compare"], default=None,
+                        help="One-stop task used by auto mode.")
+    parser.add_argument("--data", "--data-dir", dest="data_dir", default=None,
+                        help="Input folder used by auto mode.")
     parser.add_argument("-o", "--output-dir", default=None, help="Output folder.")
     parser.add_argument("-g", "--genes", default=None, help="Comma-separated gene names, gene IDs, or gene indices.")
     parser.add_argument("-f", "--gene-file", default=None, help="Text file with one gene name/ID/index per line.")
@@ -122,6 +279,18 @@ def main(argv=None):
     atac_names = _split_csv(args.atac_names)
     rna_names = _split_csv(args.rna_names)
     transcript_ids = _split_csv(args.transcripts)
+
+    if args.mode == "auto":
+        if not args.task or not args.data_dir:
+            raise ValueError("auto 模式必须指定 --task 和 --data")
+        run_auto_task(
+            args.task,
+            args.data_dir,
+            genes=genes,
+            gene_file=args.gene_file,
+            output_dir=args.output_dir,
+        )
+        return
 
     if args.mode == "fasta-index":
         from .read import FastaIndex

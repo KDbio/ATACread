@@ -2209,3 +2209,46 @@ atacread profile \
 现在先构建一次特征数据，绘图、曲线检验、表达矩阵和方向分析共享同一个 DataFrame。
 命令行和输出文件不变，只减少重复 I/O 和内存分配；`paired` 同样支持上面的两个 RNA
 区域参数。
+
+### 18.一站式简化命令
+
+日常调用不再需要把 GTF、FASTA、所有 bigWig、样本名和统计阈值全部写在命令中。
+新的 `auto` 入口只需要选择任务并给出数据目录：
+
+```bash
+# 1. BAM 质控、片段分布、BAM 转 bigWig、可选 count matrix/PyDESeq2
+atacread auto --task bam --data data/bam_experiment
+
+# 2. 读取该目录全部 ATAC/RNA bigWig，输出全基因 CSV
+atacread auto --task catalog --data data/bigwig_experiment
+
+# 3. 读取 ATAC/RNA bigWig 并比较目标基因
+atacread auto --task compare --data data/bigwig_experiment --genes POU5F1
+```
+
+`compare` 仍需指定 `--genes`，也可以把基因逐行写入 `gene*.txt` 放进数据目录，此时可
+省略 `--genes`。这是唯一不能由文件名可靠推断的分析信息。
+
+文件发现规则如下：
+
+1. 优先读取指定目录的直接文件，避免把其他子目录的数据集混进同一次分析；
+2. 如果直接目录没有对应文件，才递归查找子目录，例如时间序列的多个 `time_*`；
+3. GTF 和 FASTA 可以放在当前目录，也可以放在向上的三层父目录；
+4. 文件名含 `ATAC` 的 `.bw/.bigWig` 归为 ATAC，含 `RNA` 的归为 RNA；
+5. BAM 模式自动寻找 peak/region/consensus BED；同时存在 count matrix 前提和包含
+   `sample + condition/group` 的 metadata CSV 时，继续执行 PyDESeq2，否则明确提示跳过。
+
+隐式默认值仍是项目当前确定的参数：启动子上下游各 200 bp、自动分箱、200 次随机
+检验、`p <= 0.10`、`|log2FC| >= 0.25`、RNA 外显子并集；BAM 使用 MAPQ 30、去重复、
+自动建立 BAM 索引，并生成 50 bp CPM bigWig。
+
+输出目录默认使用第一个 ATAC 文件去掉 `.bigWig/.bw` 后命名。例如：
+
+```text
+sample_ATAC1.bigWig + compare -> output_sample_ATAC1_compare
+sample_ATAC1.bigWig + catalog -> output_sample_ATAC1_catalog
+sample_ATAC.bam     + bam     -> output_sample_ATAC_bam
+```
+
+仍可使用 `-o` 手动覆盖输出目录。原来的 `profile/catalog/bam/paired` 完整参数命令全部
+保留，用于需要改变默认统计方法或精确指定文件的高级分析。
