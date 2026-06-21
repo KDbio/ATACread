@@ -70,6 +70,26 @@ Output names are derived from the first ATAC bigWig stem, for example
 first BAM stem. PyDESeq2 runs only when a peak BED and compatible metadata CSV
 are both available.
 
+### Preflight checks and failure records
+
+The one-stop wrapper validates inputs before a long analysis starts. It rejects
+missing or empty files, unreadable bigWigs, duplicate paths or sample names,
+ATAC/RNA tracks whose chromosome lengths disagree with the FASTA, unsorted BAM
+files that cannot be indexed, invalid gene lists, and mismatched metadata/count
+matrices. `chr1` and `1` chromosome naming styles are treated as aliases; true
+chromosome-length differences are reported as a likely reference-build mismatch.
+
+Every automatic run writes `run_manifest.json` with discovered inputs, derived
+sample names, defaults, warnings, status, and output files. A failed run also
+writes `run_error.log` with the complete Python traceback. Optional PyDESeq2
+errors are recorded as warnings and do not discard completed BAM QC or bigWig
+files. If an automatically named output folder already exists, ATACread creates
+`_2`, `_3`, and so on instead of overwriting it. Explicit `-o` paths remain under
+the user's control.
+
+FASTA and GTF indexes are normally stored beside their source files. When that
+folder is read-only, ATACread falls back to `~/.cache/atacread`.
+
 ### Advanced commands
 
 ```text

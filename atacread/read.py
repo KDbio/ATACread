@@ -771,9 +771,25 @@ class FastaIndex:
 
     def __init__(self, fasta_file, index_file=None):
         self.fasta_file = os.path.abspath(os.fspath(fasta_file))
-        self.index_file = os.path.abspath(
-            os.fspath(index_file) if index_file else self.fasta_file + ".fai"
-        )
+        if index_file:
+            selected_index = os.fspath(index_file)
+        else:
+            adjacent = self.fasta_file + ".fai"
+            parent = os.path.dirname(adjacent) or "."
+            adjacent_is_current = (
+                os.path.exists(adjacent)
+                and os.stat(adjacent).st_mtime_ns >= os.stat(self.fasta_file).st_mtime_ns
+            )
+            if adjacent_is_current or os.access(parent, os.W_OK):
+                selected_index = adjacent
+            else:
+                stat = os.stat(self.fasta_file)
+                identity = f"{self.fasta_file}|{stat.st_size}|{stat.st_mtime_ns}"
+                digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+                cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "atacread")
+                os.makedirs(cache_dir, exist_ok=True)
+                selected_index = os.path.join(cache_dir, f"fasta-{digest}.fai")
+        self.index_file = os.path.abspath(selected_index)
 
     def is_valid(self):
         if not os.path.exists(self.index_file):
@@ -1170,6 +1186,82 @@ def get_genes_sequences_batch(
 # BigWig Reader (ATAC / RNA) —— 只保留原始信号, 不做统计
 # ============================================================
 
+def _normalized_chrom_lengths(chroms):
+    normalized = {}
+    for chrom, length in chroms.items():
+        name = str(chrom).lower()
+        if name.startswith("chr"):
+            name = name[3:]
+        if name == "m":
+            name = "mt"
+        normalized[name] = int(length)
+    return normalized
+
+
+def validate_bigwig_files(bw_files, fasta_file=None):
+    """Validate readable bigWigs and detect likely reference-build mismatches."""
+    if pyBigWig is None:
+        raise ImportError("BigWig 预检需要安装 pyBigWig")
+    paths = [str(path) for path in (bw_files or [])]
+    if len(set(os.path.abspath(path) for path in paths)) != len(paths):
+        raise ValueError("BigWig 文件列表中存在重复路径")
+
+    reference = None
+    if fasta_file is not None:
+        if not os.path.isfile(fasta_file) or os.path.getsize(fasta_file) == 0:
+            raise ValueError(f"FASTA 不存在或为空: {fasta_file}")
+        fasta_index = FastaIndex(fasta_file)
+        fasta_index.build()
+        reference = _normalized_chrom_lengths({
+            name: entry["length"]
+            for name, entry in fasta_index.read_entries().items()
+        })
+
+    reports = []
+    canonical = {str(value) for value in range(1, 23)} | {"x", "y", "mt"}
+    for path in paths:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"BigWig 文件不存在: {path}")
+        if os.path.getsize(path) == 0:
+            raise ValueError(f"BigWig 文件为空: {path}")
+        handle = None
+        try:
+            handle = pyBigWig.open(path)
+            if handle is None:
+                raise ValueError("pyBigWig.open 返回空句柄")
+            chroms = handle.chroms()
+            if not chroms:
+                raise ValueError("文件中没有染色体")
+        except Exception as exc:
+            raise ValueError(f"BigWig 无法读取: {path}: {exc}") from exc
+        finally:
+            if handle is not None:
+                handle.close()
+
+        normalized = _normalized_chrom_lengths(chroms)
+        if reference is None:
+            reference = normalized
+        common = canonical & set(reference) & set(normalized)
+        if not common:
+            raise ValueError(
+                f"BigWig 与 FASTA/其他轨道没有共同的常规染色体: {path}"
+            )
+        mismatched = [
+            chrom for chrom in sorted(common)
+            if reference[chrom] != normalized[chrom]
+        ]
+        if mismatched:
+            preview = ", ".join(mismatched[:5])
+            raise ValueError(
+                f"疑似参考基因组版本不一致: {path}; 染色体长度不同: {preview}"
+            )
+        reports.append({
+            "path": path,
+            "n_chromosomes": len(chroms),
+            "common_canonical_chromosomes": len(common),
+        })
+    return reports
+
 class BigWigReader:
     """BigWig 读取父类，封装通用逻辑。返回每个碱基的原始信号。"""
 
@@ -1191,6 +1283,13 @@ class BigWigReader:
             bw_files = [bw_files]
 
         self.bw_files = [str(f) for f in bw_files]
+        if not self.bw_files:
+            raise ValueError("至少需要一个 BigWig 文件")
+        for path in self.bw_files:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"BigWig 文件不存在: {path}")
+            if os.path.getsize(path) == 0:
+                raise ValueError(f"BigWig 文件为空: {path}")
         self.label = label
         self.regions = regions or ("gene_body",)
 
@@ -1200,7 +1299,11 @@ class BigWigReader:
             ]
         if len(sample_names) != len(self.bw_files):
             raise ValueError("sample_names 长度必须与 bw_files 一致")
-        self.sample_names = sample_names
+        self.sample_names = [str(name).strip() for name in sample_names]
+        if any(not name for name in self.sample_names):
+            raise ValueError("sample_names 不能包含空名称")
+        if len(set(self.sample_names)) != len(self.sample_names):
+            raise ValueError(f"sample_names 不能重复: {self.sample_names}")
 
         self._bw_handles = None
         self._bw_chroms = None
@@ -1209,8 +1312,23 @@ class BigWigReader:
         if pyBigWig is None:
             raise ImportError("读取 BigWig 文件需要先安装 pyBigWig")
         if self._bw_handles is None:
-            self._bw_handles = [pyBigWig.open(f) for f in self.bw_files]
-            self._bw_chroms = [bw.chroms() for bw in self._bw_handles]
+            handles = []
+            try:
+                for path in self.bw_files:
+                    handle = pyBigWig.open(path)
+                    if handle is None:
+                        raise ValueError(f"无法打开 BigWig: {path}")
+                    chroms = handle.chroms()
+                    if not chroms:
+                        handle.close()
+                        raise ValueError(f"BigWig 不包含染色体: {path}")
+                    handles.append(handle)
+            except Exception as exc:
+                for handle in handles:
+                    handle.close()
+                raise ValueError(f"BigWig 预检失败: {exc}") from exc
+            self._bw_handles = handles
+            self._bw_chroms = [bw.chroms() for bw in handles]
 
     def close(self):
         if self._bw_handles is not None:

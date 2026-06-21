@@ -16,7 +16,9 @@ from .bam_tools import (
     pydeseq2_differential,
     run_bam_downstream,
 )
-from .read import FastaIndex, GTFAnnotationCache
+from .read import FastaIndex, GTFAnnotationCache, validate_bigwig_files
+
+__version__ = "0.7.0"
 
 __all__ = [
     "extract_multiomics_features",
@@ -33,4 +35,5 @@ __all__ = [
     "run_bam_downstream",
     "FastaIndex",
     "GTFAnnotationCache",
+    "validate_bigwig_files",
 ]

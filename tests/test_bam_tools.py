@@ -12,13 +12,23 @@ except ImportError:  # pragma: no cover - optional dependency
     pyBigWig = None
     pysam = None
 
-from atacread.bam_tools import bam_to_bigwig, run_bam_downstream
+from atacread.bam_tools import _validate_bam_inputs, bam_to_bigwig, run_bam_downstream
 from atacread.cli import main as cli_main
 
 
 @unittest.skipUnless(pysam is not None and pyBigWig is not None,
                      "requires pysam and pyBigWig")
 class BamToolsIntegrationTest(unittest.TestCase):
+    def test_empty_bam_and_empty_sample_name_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bam = Path(tmp) / "empty.bam"
+            bam.touch()
+            with self.assertRaisesRegex(ValueError, "为空"):
+                _validate_bam_inputs([bam])
+            bam.write_bytes(b"BAM")
+            with self.assertRaisesRegex(ValueError, "空名称"):
+                _validate_bam_inputs([bam], sample_names=["  "])
+
     def _pair(self, name, start, fragment_length=100, mapq=60,
               duplicate=False):
         read_length = 50

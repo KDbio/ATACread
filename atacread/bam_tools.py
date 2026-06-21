@@ -43,18 +43,25 @@ def _validate_bam_inputs(bam_files, sample_names=None):
     missing = [p for p in bam_files if not os.path.isfile(p)]
     if missing:
         raise FileNotFoundError(f"BAM 文件不存在: {missing}")
-
+    empty = [p for p in bam_files if os.path.getsize(p) == 0]
+    if empty:
+        raise ValueError(f"BAM 文件为空: {empty}")
     if sample_names is None:
         sample_names = [_sample_name(p) for p in bam_files]
     else:
-        sample_names = [str(s) for s in sample_names]
+        sample_names = [str(s).strip() for s in sample_names]
         if len(sample_names) != len(bam_files):
             raise ValueError(
                 f"sample_names 数量 ({len(sample_names)}) 与 BAM 数量 "
                 f"({len(bam_files)}) 不一致"
             )
+    if any(not name for name in sample_names):
+        raise ValueError("sample_names 不能包含空名称")
     if len(set(sample_names)) != len(sample_names):
         raise ValueError("sample_names 不能重复")
+    real_paths = [os.path.realpath(p) for p in bam_files]
+    if len(set(real_paths)) != len(real_paths):
+        raise ValueError("BAM 文件列表中存在重复路径")
     return bam_files, sample_names
 
 

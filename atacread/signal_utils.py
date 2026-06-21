@@ -657,7 +657,7 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
     
     items = []
     if gene_file:
-        with open(gene_file) as f:
+        with open(gene_file, encoding="utf-8-sig") as f:
             items += [line.strip() for line in f if line.strip() and not line.startswith("#")]
     if genes:
         items += [genes] if isinstance(genes, (str, int)) else list(genes)
@@ -685,31 +685,54 @@ def resolve_genes(gtf_file, genes=None, gene_file=None,
     parts = []
     if names:
         if use_cache:
-            parts.append(cache.read(
+            name_frame = cache.read(
                 queries=names,
                 promoter_upstream=promoter_upstream,
                 promoter_downstream=promoter_downstream,
-            ))
+            )
         else:
-            parts.append(GTFQueryReader(
+            name_frame = GTFQueryReader(
                 gtf_file,
                 queries=names,
                 promoter_upstream=promoter_upstream,
                 promoter_downstream=promoter_downstream,
-            ).read())
+            ).read()
+        found_queries = (
+            set(name_frame["query"].astype(str))
+            if not name_frame.empty and "query" in name_frame else set()
+        )
+        missing_names = [name for name in dict.fromkeys(names) if name not in found_queries]
+        if missing_names:
+            raise ValueError("GTF 中未找到这些基因: " + ", ".join(missing_names))
+        parts.append(name_frame)
     if indices:
         if use_cache:
-            parts.append(cache.read(
+            index_frame = cache.read(
                 indices=indices,
                 promoter_upstream=promoter_upstream,
                 promoter_downstream=promoter_downstream,
-            ))
+            )
+            found_indices = (
+                set(index_frame["gene_index"].astype(int))
+                if not index_frame.empty and "gene_index" in index_frame else set()
+            )
+            missing_indices = [
+                str(index) for index in dict.fromkeys(indices) if index not in found_indices
+            ]
+            if missing_indices:
+                raise ValueError("GTF 中不存在这些基因序号: " + ", ".join(missing_indices))
         else:
             all_df = GTFFullReader(
                 gtf_file,
                 promoter_upstream=promoter_upstream,
                 promoter_downstream=promoter_downstream,
             ).read()
-            parts.append(all_df.iloc[indices])
+            invalid = [index for index in dict.fromkeys(indices) if index < 0 or index >= len(all_df)]
+            if invalid:
+                raise ValueError(
+                    "GTF 中不存在这些基因序号: " + ", ".join(map(str, invalid))
+                )
+            index_frame = all_df.iloc[indices]
+        parts.append(index_frame)
     
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["gene_id"])

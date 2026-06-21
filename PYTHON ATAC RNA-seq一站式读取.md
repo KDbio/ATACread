@@ -2252,3 +2252,75 @@ sample_ATAC.bam     + bam     -> output_sample_ATAC_bam
 
 仍可使用 `-o` 手动覆盖输出目录。原来的 `profile/catalog/bam/paired` 完整参数命令全部
 保留，用于需要改变默认统计方法或精确指定文件的高级分析。
+
+### 19.全链条预检、警告与失败记录
+
+一站式命令的一个问题是：参数虽然少了，但如果程序自动选错文件，用户不一定马上能
+发现。现在 `auto` 模式不是找到文件后立刻开始计算，而是先做一轮预检。
+
+#### 19.1 开始计算前检查什么
+
+1. 检查 GTF、FASTA、BAM、BED、基因列表是否存在且不是空文件；
+2. 用 `pyBigWig` 实际打开每个 bigWig，不能打开或没有染色体时立即停止；
+3. 比较 bigWig 与 FASTA 的常规染色体长度。`chr1` 和 `1` 会当作同一条染色体，
+   但长度不同会提示“疑似参考基因组版本不一致”；
+4. 拒绝重复文件路径、重复或空的样本名，并检查样本名数量是否等于文件数量；
+5. `profile/paired/compare` 检查目标基因是否真的存在。文本中只要有一个基因或基因
+   序号没有命中 GTF，就会明确列出，不再静默少分析几个；
+6. BAM 检查文件是否为空、是否能建立索引以及是否按坐标排序。BED 没有有效区域、
+   BED 与 BAM 染色体不匹配、metadata 与 count matrix 样本不匹配时都会给出具体原因；
+7. 自动输出目录已经存在时，不覆盖旧结果，而是依次使用 `_2`、`_3` 等新目录；
+8. 输出目录在正式计算前会试写一个临时文件，提前发现权限不足或磁盘挂载为只读。
+
+FASTA 的 `.fai` 和 GTF 的 SQLite 索引优先写在原文件旁边。如果数据目录只读，索引会
+自动改写到：
+
+```text
+~/.cache/atacread
+```
+
+这样从共享目录或只读数据盘安装使用时，不会因为无法创建索引而中断。
+
+#### 19.2 每次自动运行留下什么记录
+
+输出目录一创建就会写入：
+
+```text
+run_manifest.json
+```
+
+其中记录任务类型、数据目录、自动发现的 GTF/FASTA/ATAC/RNA/BAM、推导出的样本名、
+隐式默认参数、开始与结束时间、警告和最终输出文件。`status` 有两个主要值：
+
+```text
+completed   主流程完成
+failed      主流程失败
+```
+
+如果失败，输出目录还会出现：
+
+```text
+run_error.log
+```
+
+这里保存完整的 Python traceback。以后报告报错时，应同时查看终端最后一行、
+`run_manifest.json` 和 `run_error.log`，不必只凭一张截图猜测失败位置。
+
+PyDESeq2 属于 BAM 主流程之后的可选步骤。如果缺少 peak BED、metadata，或者 metadata
+列名/样本对应关系不正确，程序会把原因写入 `warnings` 并跳过差异分析，但已经完成的
+BAM 质控、片段长度、FRiP、TSS、count matrix 或 bigWig 不会被判定为全部失败。
+
+#### 19.3 最常见的报错怎样处理
+
+| 提示 | 常见原因 | 处理方法 |
+|---|---|---|
+| 疑似参考基因组版本不一致 | bigWig 与 FASTA 分别来自 hg19、hg38 或其他组装 | 换成同一参考基因组生成的 GTF、FASTA 和轨道 |
+| 文件名不含 ATAC/RNA，已忽略 | bigWig 名称无法自动分类 | 在文件名中加入 `ATAC` 或 `RNA`，或改用高级命令显式传入 |
+| GTF 中未找到这些基因 | 基因名拼写、物种或注释版本不一致 | 用 GTF 中的 `gene_name`、完整/去版本号 Ensembl ID 或合法序号 |
+| BAM 缺少索引且无法建立 | BAM 未按坐标排序或文件损坏 | 先用 `samtools sort/index`，或用 `pysam.sort/index` |
+| BigWig 文件为空/无法读取 | 下载不完整、文件不是 bigWig 或扩展名改错 | 重新下载，并用 `pyBigWig.open()` 检查 |
+| count matrix 与 metadata 匹配少于 2 个样本 | `sample` 名称不同 | 让 metadata 的 `sample` 与 count matrix 列名完全一致 |
+| 输出目录不可写 | Windows/WSL 权限、只读挂载或磁盘满 | 换到可写目录并检查剩余空间 |
+
+这些预检也加到了高级 `catalog/profile/paired` 的命令入口，因此不使用 `auto` 时也会
+在真正扫描 GTF 和 bigWig 前得到相同类型的清楚提示。

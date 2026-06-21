@@ -12,12 +12,14 @@ except ImportError:  # pragma: no cover - optional dependency
     pyBigWig = None
 
 from atacread.read import (
+    BigWigReader,
     RNAReader,
     attach_exon_intervals,
     GTFAnnotationCache,
     FastaIndex,
     fasta_read,
     configure_rna_regions,
+    validate_bigwig_files,
 )
 from atacread.signal_utils import (
     binned_permutation_test,
@@ -26,8 +28,14 @@ from atacread.signal_utils import (
     _deviation_items,
     overall_deviation_tests,
     plot_gene_signals,
+    resolve_genes,
 )
-from atacread.cli import main as cli_main
+from atacread.cli import (
+    _automatic_output_dir,
+    _prepare_output_dir,
+    _unique_sample_names,
+    main as cli_main,
+)
 from atacread.multiomics import run_paired
 
 
@@ -175,6 +183,11 @@ class GTFCacheTest(unittest.TestCase):
             cli_main(["gtf-index", "--gtf", str(gtf)])
             self.assertTrue(Path(str(gtf) + ".atacread.sqlite").exists())
 
+            with self.assertRaisesRegex(ValueError, "MISSING_GENE"):
+                resolve_genes(gtf, genes=["GENE1", "MISSING_GENE"])
+            with self.assertRaisesRegex(ValueError, "999"):
+                resolve_genes(gtf, genes=[999], include_exons=True)
+
 
 class FastaIndexTest(unittest.TestCase):
     def test_fai_build_and_targeted_read(self):
@@ -248,8 +261,29 @@ class PairedReuseTest(unittest.TestCase):
 
 class AutoCliTest(unittest.TestCase):
     def _write_reference_files(self, folder):
-        (folder / "genes.gtf").write_text("", encoding="utf-8")
+        (folder / "genes.gtf").write_text(
+            'chr1\ttest\tgene\t1\t1\t.\t+\t.\tgene_id "G1"; gene_name "G1";\n',
+            encoding="utf-8",
+        )
         (folder / "genome.fa").write_text(">chr1\nA\n", encoding="utf-8")
+
+    def test_automatic_output_name_and_collision(self):
+        self.assertEqual(
+            _automatic_output_dir("compare", atac_files=["sample_ATAC1.bigWig"]),
+            "output_sample_ATAC1_compare",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "output_sample_compare"
+            first.mkdir()
+            second = _prepare_output_dir(first, make_unique=True)
+            self.assertEqual(second.name, "output_sample_compare_2")
+
+    def test_duplicate_stems_get_unique_sample_names(self):
+        names = _unique_sample_names([
+            "/data/control/sample.bw",
+            "/data/treated/sample.bw",
+        ])
+        self.assertEqual(names, ["control_sample", "treated_sample"])
 
     def test_auto_compare_discovers_files_and_output_name(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,15 +295,19 @@ class AutoCliTest(unittest.TestCase):
             (data / "sample_ATAC2.bigWig").touch()
             (data / "sample_RNA1.bigWig").touch()
 
-            with mock.patch("atacread.cli.run_profile") as run_profile:
+            output = root / "compare_output"
+            with mock.patch("atacread.cli.validate_bigwig_files"), mock.patch(
+                "atacread.cli.run_profile"
+            ) as run_profile:
                 cli_main([
                     "auto", "--task", "compare", "--data", str(data),
                     "--genes", "POU5F1",
+                    "--output-dir", str(output),
                 ])
 
             kwargs = run_profile.call_args.kwargs
             self.assertEqual(kwargs["genes"], ["POU5F1"])
-            self.assertEqual(kwargs["output_dir"], "output_sample_ATAC1_compare")
+            self.assertEqual(kwargs["output_dir"], str(output))
             self.assertEqual(len(kwargs["atac_files"]), 2)
             self.assertEqual(len(kwargs["rna_files"]), 1)
             self.assertEqual(kwargs["n_permutations"], 200)
@@ -281,25 +319,32 @@ class AutoCliTest(unittest.TestCase):
             (data / "batch_ATAC.bigWig").touch()
             (data / "batch_RNA.bigWig").touch()
 
-            with mock.patch("atacread.cli.run_catalog") as run_catalog:
-                cli_main(["auto", "--task", "catalog", "--data", str(data)])
+            output = data / "catalog_output"
+            with mock.patch("atacread.cli.validate_bigwig_files"), mock.patch(
+                "atacread.cli.run_catalog"
+            ) as run_catalog:
+                cli_main([
+                    "auto", "--task", "catalog", "--data", str(data),
+                    "--output-dir", str(output),
+                ])
 
             kwargs = run_catalog.call_args.kwargs
-            self.assertEqual(kwargs["output_dir"], "output_batch_ATAC_catalog")
+            self.assertEqual(kwargs["output_dir"], str(output))
             self.assertEqual(kwargs["promoter_upstream"], 200)
             self.assertEqual(kwargs["promoter_downstream"], 200)
 
     def test_auto_bam_runs_qc_and_bigwig_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
-            (data / "sample_ATAC.bam").touch()
-            (data / "consensus_peaks.bed").touch()
+            (data / "sample_ATAC.bam").write_bytes(b"BAM")
+            (data / "consensus_peaks.bed").write_text("chr1\t0\t1\n", encoding="utf-8")
             metadata = data / "metadata.csv"
             metadata.write_text(
                 "sample,group\nsample_ATAC,control\n",
                 encoding="utf-8",
             )
             count_matrix = data / "count_matrix.csv"
+            output = data / "bam_output"
 
             with mock.patch(
                 "atacread.cli.run_bam_downstream",
@@ -307,14 +352,63 @@ class AutoCliTest(unittest.TestCase):
             ) as run_bam, mock.patch(
                 "atacread.cli.pydeseq2_differential"
             ) as run_deseq2:
-                cli_main(["auto", "--task", "bam", "--data", str(data)])
+                cli_main([
+                    "auto", "--task", "bam", "--data", str(data),
+                    "--output-dir", str(output),
+                ])
 
             kwargs = run_bam.call_args.kwargs
-            self.assertEqual(kwargs["output_dir"], "output_sample_ATAC_bam")
+            self.assertEqual(kwargs["output_dir"], str(output))
             self.assertTrue(kwargs["make_bigwig"])
             self.assertEqual(kwargs["bigwig_bin_size"], 50)
             self.assertTrue(str(kwargs["regions_bed"]).endswith("consensus_peaks.bed"))
             self.assertEqual(run_deseq2.call_args.kwargs["condition_col"], "group")
+
+    def test_failure_writes_manifest_and_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            self._write_reference_files(data)
+            (data / "sample_ATAC.bigWig").touch()
+            output = data / "failed_output"
+            with mock.patch("atacread.cli.validate_bigwig_files"), mock.patch(
+                "atacread.cli.run_profile", side_effect=RuntimeError("simulated failure")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated failure"):
+                    cli_main([
+                        "auto", "--task", "compare", "--data", str(data),
+                        "--genes", "G1", "--output-dir", str(output),
+                    ])
+            manifest = pd.read_json(output / "run_manifest.json", typ="series")
+            self.assertEqual(manifest["status"], "failed")
+            self.assertIn("simulated failure", (output / "run_error.log").read_text())
+
+
+@unittest.skipUnless(pyBigWig is not None, "requires pyBigWig")
+class BigWigValidationTest(unittest.TestCase):
+    def test_reference_length_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            fasta = tmp / "genome.fa"
+            bigwig = tmp / "sample.bw"
+            fasta.write_text(">chr1\n" + "A" * 100 + "\n", encoding="utf-8")
+            with pyBigWig.open(str(bigwig), "w") as bw:
+                bw.addHeader([("chr1", 90)])
+                bw.addEntries(["chr1"], [0], ends=[90], values=[1.0])
+            with self.assertRaisesRegex(ValueError, "参考基因组版本"):
+                validate_bigwig_files([bigwig], fasta_file=fasta)
+
+    def test_duplicate_sample_names_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            paths = []
+            for index in range(2):
+                path = tmp / f"sample{index}.bw"
+                with pyBigWig.open(str(path), "w") as bw:
+                    bw.addHeader([("chr1", 10)])
+                    bw.addEntries(["chr1"], [0], ends=[10], values=[1.0])
+                paths.append(path)
+            with self.assertRaisesRegex(ValueError, "重复"):
+                BigWigReader(paths, sample_names=["same", "same"])
 
 
 @unittest.skipUnless(pyBigWig is not None, "requires pyBigWig")

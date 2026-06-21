@@ -1,11 +1,18 @@
 """Command line interface for ATACread."""
 
 import argparse
+import json
+import os
+import re
+import shutil
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
 from .multiomics import run_catalog, run_profile, run_paired
 from .bam_tools import run_bam_downstream, pydeseq2_differential
+from .read import validate_bigwig_files
 
 
 def _split_csv(value):
@@ -61,7 +68,69 @@ def _find_reference_file(data_dir, suffixes):
 def _automatic_output_dir(task, atac_files=None, bam_files=None):
     sources = atac_files or bam_files or []
     stem = Path(sources[0]).stem if sources else "atacread"
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" ._")
+    stem = stem[:120] or "atacread"
     return f"output_{stem}_{task}"
+
+
+def _unique_sample_names(paths):
+    """Create stable names without silently overwriting duplicate stems."""
+    stems = [Path(path).stem for path in paths]
+    counts = {stem: stems.count(stem) for stem in set(stems)}
+    names = []
+    used = set()
+    for path, stem in zip(paths, stems):
+        candidate = stem
+        if counts[stem] > 1:
+            candidate = f"{Path(path).parent.name}_{stem}"
+        base = candidate
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        names.append(candidate)
+    return names
+
+
+def _prepare_output_dir(path, make_unique=False):
+    candidate = Path(path)
+    if candidate.exists() and candidate.is_file():
+        raise ValueError(f"输出路径是文件而不是目录: {candidate}")
+    if make_unique and candidate.exists():
+        base = candidate
+        suffix = 2
+        while candidate.exists():
+            candidate = Path(f"{base}_{suffix}")
+            suffix += 1
+        print(f"[auto] 默认输出目录已存在，改用: {candidate}")
+    candidate.mkdir(parents=True, exist_ok=True)
+    probe = candidate / ".atacread_write_test"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise PermissionError(f"输出目录不可写: {candidate}: {exc}") from exc
+    return candidate
+
+
+def _write_manifest(output_dir, payload):
+    path = Path(output_dir) / "run_manifest.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+    return str(path)
+
+
+def _check_nonempty_files(paths, label):
+    for path in paths:
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"{label} 文件不存在: {path}")
+        if Path(path).stat().st_size == 0:
+            raise ValueError(f"{label} 文件为空: {path}")
 
 
 def run_auto_task(task, data_dir, genes=None, gene_file=None, output_dir=None):
@@ -79,105 +148,201 @@ def run_auto_task(task, data_dir, genes=None, gene_file=None, output_dir=None):
     atac = _find_data_files(data_dir, [".bw", ".bigwig"], keywords=["atac"])
     rna = _find_data_files(data_dir, [".bw", ".bigwig"], keywords=["rna"])
     bams = _find_data_files(data_dir, [".bam"])
+    all_bigwigs = _find_data_files(data_dir, [".bw", ".bigwig"])
+    unclassified_bigwigs = sorted(set(all_bigwigs) - set(atac) - set(rna))
+    automatic_output = output_dir is None
     output_dir = output_dir or _automatic_output_dir(
-        task,
-        atac_files=atac if task != "bam" else None,
-        bam_files=bams,
+        task, atac_files=atac if task != "bam" else None, bam_files=bams
     )
+    output_dir = _prepare_output_dir(output_dir, make_unique=automatic_output)
+    atac_names = _unique_sample_names(atac)
+    rna_names = _unique_sample_names(rna)
+    bam_names = _unique_sample_names(bams)
 
     print(f"[auto] task   : {task}")
     print(f"[auto] data   : {data_dir}")
     print(f"[auto] output : {output_dir}")
     print(f"[auto] ATAC/RNA/BAM: {len(atac)}/{len(rna)}/{len(bams)}")
+    if unclassified_bigwigs:
+        print(f"[auto] 警告: {len(unclassified_bigwigs)} 个 bigWig 文件名不含 ATAC/RNA，已忽略")
 
-    if task == "bam":
-        if not bams:
-            raise FileNotFoundError(f"{data_dir} 中没有找到 BAM")
-        beds = _find_data_files(data_dir, [".bed", ".bed.gz"])
-        peak_beds = [
-            path for path in beds
-            if any(word in Path(path).name.lower() for word in ("peak", "region", "consensus"))
-        ]
-        regions = peak_beds[0] if peak_beds else (beds[0] if beds else None)
-        tss_beds = [path for path in beds if "tss" in Path(path).name.lower()]
-        tss_regions = gtf or (tss_beds[0] if tss_beds else None)
-        outputs = run_bam_downstream(
-            bams,
-            regions_bed=regions,
-            output_dir=output_dir,
-            min_mapq=30,
-            make_bigwig=True,
-            bigwig_bin_size=50,
-            tss_regions=tss_regions,
-            auto_index=True,
-            keep_duplicates=False,
+    warnings = []
+    if unclassified_bigwigs:
+        warnings.append(
+            f"忽略 {len(unclassified_bigwigs)} 个文件名不含 ATAC/RNA 的 bigWig"
         )
+    manifest = {
+        "status": "started",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "task": task,
+        "data_dir": str(data_dir.resolve()),
+        "output_dir": str(output_dir.resolve()),
+        "inputs": {
+            "gtf": gtf,
+            "fasta": fasta,
+            "atac_bigwigs": atac,
+            "rna_bigwigs": rna,
+            "bam_files": bams,
+            "unclassified_bigwigs": unclassified_bigwigs,
+            "genes": genes,
+            "gene_file": gene_file,
+        },
+        "sample_names": {
+            "atac": atac_names,
+            "rna": rna_names,
+            "bam": bam_names,
+        },
+        "defaults": {
+            "promoter_upstream": 200,
+            "promoter_downstream": 200,
+            "n_permutations": 200,
+            "significance_level": 0.10,
+            "lfc_threshold": 0.25,
+            "rna_region_mode": "exon_union",
+            "bam_min_mapq": 30,
+            "bigwig_bin_size": 50,
+        },
+        "warnings": warnings,
+    }
+    _write_manifest(output_dir, manifest)
 
-        metadata_candidates = _find_data_files(
-            data_dir,
-            [".csv"],
-            keywords=["metadata", "design", "sample"],
-        )
-        count_matrix = outputs.get("count_matrix_csv")
-        if count_matrix and metadata_candidates:
-            deseq_csv = str(Path(output_dir) / "pydeseq2_results.csv")
-            try:
-                metadata_columns = pd.read_csv(metadata_candidates[0], nrows=1).columns
-                condition_col = (
-                    "condition" if "condition" in metadata_columns
-                    else "group" if "group" in metadata_columns
-                    else "condition"
-                )
-                pydeseq2_differential(
-                    count_matrix,
-                    metadata_candidates[0],
-                    condition_col=condition_col,
-                    output_csv=deseq_csv,
-                )
-                outputs["deseq2_csv"] = deseq_csv
-            except (ValueError, ImportError) as exc:
-                print(f"[auto] 跳过差异分析: {exc}")
+    try:
+        if task == "bam":
+            if not bams:
+                raise FileNotFoundError(f"{data_dir} 中没有找到 BAM")
+            _check_nonempty_files(bams, "BAM")
+            free_space = shutil.disk_usage(output_dir).free
+            bam_bytes = sum(Path(path).stat().st_size for path in bams)
+            if free_space < bam_bytes:
+                warning = "输出磁盘剩余空间小于 BAM 总大小，bigWig 生成可能失败"
+                warnings.append(warning)
+                print(f"[auto] 警告: {warning}")
+
+            beds = _find_data_files(data_dir, [".bed", ".bed.gz"])
+            peak_beds = [
+                path for path in beds
+                if any(word in Path(path).name.lower() for word in ("peak", "region", "consensus"))
+            ]
+            regions = peak_beds[0] if peak_beds else (beds[0] if beds else None)
+            if regions:
+                _check_nonempty_files([regions], "BED")
+            tss_beds = [path for path in beds if "tss" in Path(path).name.lower()]
+            tss_regions = gtf or (tss_beds[0] if tss_beds else None)
+            outputs = run_bam_downstream(
+                bams,
+                regions_bed=regions,
+                output_dir=str(output_dir),
+                sample_names=bam_names,
+                min_mapq=30,
+                make_bigwig=True,
+                bigwig_bin_size=50,
+                tss_regions=tss_regions,
+                auto_index=True,
+                keep_duplicates=False,
+            )
+
+            metadata_candidates = _find_data_files(
+                data_dir, [".csv"], keywords=["metadata", "design", "sample"]
+            )
+            count_matrix = outputs.get("count_matrix_csv")
+            if count_matrix and metadata_candidates:
+                deseq_csv = str(output_dir / "pydeseq2_results.csv")
+                try:
+                    metadata_columns = pd.read_csv(metadata_candidates[0], nrows=1).columns
+                    condition_col = (
+                        "condition" if "condition" in metadata_columns
+                        else "group" if "group" in metadata_columns
+                        else "condition"
+                    )
+                    pydeseq2_differential(
+                        count_matrix,
+                        metadata_candidates[0],
+                        condition_col=condition_col,
+                        output_csv=deseq_csv,
+                    )
+                    outputs["deseq2_csv"] = deseq_csv
+                except Exception as exc:
+                    warning = f"PyDESeq2 差异分析已跳过: {type(exc).__name__}: {exc}"
+                    warnings.append(warning)
+                    print(f"[auto] {warning}")
+            else:
+                warning = "未同时找到 peak BED 和 metadata CSV，跳过 PyDESeq2"
+                warnings.append(warning)
+                print(f"[auto] {warning}")
+            result = outputs
         else:
-            print("[auto] 未同时找到 peak BED 和 metadata CSV，跳过 PyDESeq2")
-        return outputs
+            if not gtf or not fasta:
+                raise FileNotFoundError(
+                    "catalog/compare 需要 data 目录或其父目录中存在 GTF 和 FASTA"
+                )
+            _check_nonempty_files([gtf], "GTF")
+            _check_nonempty_files([fasta], "FASTA")
+            if not atac and not rna:
+                raise FileNotFoundError(f"{data_dir} 中没有找到 ATAC/RNA bigWig")
+            validate_bigwig_files(atac + rna, fasta_file=fasta)
 
-    if not gtf or not fasta:
-        raise FileNotFoundError("catalog/compare 需要 data 目录或其父目录中存在 GTF 和 FASTA")
-    if not atac and not rna:
-        raise FileNotFoundError(f"{data_dir} 中没有找到 ATAC/RNA bigWig")
+            if task == "catalog":
+                result = run_catalog(
+                    gtf,
+                    fasta,
+                    atac_files=atac,
+                    rna_files=rna,
+                    output_dir=str(output_dir),
+                    promoter_upstream=200,
+                    promoter_downstream=200,
+                    atac_names=atac_names or None,
+                    rna_names=rna_names or None,
+                )
+            else:
+                if not genes and not gene_file:
+                    gene_files = _find_data_files(data_dir, [".txt"], keywords=["gene"])
+                    gene_file = gene_files[0] if gene_files else None
+                    manifest["inputs"]["gene_file"] = gene_file
+                if not genes and not gene_file:
+                    raise ValueError("compare 需要 --genes 或 data 目录中的 gene*.txt")
+                if gene_file:
+                    _check_nonempty_files([gene_file], "基因列表")
+                result = run_profile(
+                    gtf,
+                    fasta,
+                    atac_files=atac,
+                    rna_files=rna,
+                    genes=genes,
+                    gene_file=gene_file,
+                    output_dir=str(output_dir),
+                    promoter_upstream=200,
+                    promoter_downstream=200,
+                    atac_names=atac_names or None,
+                    rna_names=rna_names or None,
+                    bin_size="auto",
+                    n_permutations=200,
+                    significance_level=0.10,
+                    lfc_threshold=0.25,
+                    rna_region_mode="exon_union",
+                )
+    except Exception as exc:
+        manifest.update({
+            "status": "failed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+        _write_manifest(output_dir, manifest)
+        (output_dir / "run_error.log").write_text(traceback.format_exc(), encoding="utf-8")
+        print(f"[auto] 运行失败: {exc}")
+        print(f"[auto] 详情: {output_dir / 'run_error.log'}")
+        raise
 
-    if task == "catalog":
-        return run_catalog(
-            gtf,
-            fasta,
-            atac_files=atac,
-            rna_files=rna,
-            output_dir=output_dir,
-            promoter_upstream=200,
-            promoter_downstream=200,
-        )
-
-    if not genes and not gene_file:
-        gene_files = _find_data_files(data_dir, [".txt"], keywords=["gene"])
-        gene_file = gene_files[0] if gene_files else None
-    if not genes and not gene_file:
-        raise ValueError("compare 需要 --genes 或 data 目录中的 gene*.txt")
-    return run_profile(
-        gtf,
-        fasta,
-        atac_files=atac,
-        rna_files=rna,
-        genes=genes,
-        gene_file=gene_file,
-        output_dir=output_dir,
-        promoter_upstream=200,
-        promoter_downstream=200,
-        bin_size="auto",
-        n_permutations=200,
-        significance_level=0.10,
-        lfc_threshold=0.25,
-        rna_region_mode="exon_union",
-    )
+    manifest.update({
+        "status": "completed",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "output_files": sorted(
+            str(path.relative_to(output_dir))
+            for path in output_dir.rglob("*") if path.is_file()
+        ),
+    })
+    _write_manifest(output_dir, manifest)
+    return result
 
 
 def detect_inputs(work_dir, gtf=None, fasta=None, atac=None, rna=None):
@@ -201,6 +366,42 @@ def detect_inputs(work_dir, gtf=None, fasta=None, atac=None, rna=None):
     print(f"ATAC  : {len(atac)} files")
     print(f"RNA   : {len(rna)} files")
     return gtf, fasta, atac, rna
+
+
+def _validate_analysis_inputs(
+    mode, gtf, fasta, atac, rna, genes=None, gene_file=None,
+    atac_names=None, rna_names=None, metadata=None,
+):
+    """Fail at the CLI boundary with actionable input errors."""
+    missing = [label for label, value in (("GTF", gtf), ("FASTA", fasta)) if not value]
+    if missing:
+        raise FileNotFoundError(
+            f"{mode} 模式缺少 {', '.join(missing)}；请显式指定文件或检查 --work-dir"
+        )
+    _check_nonempty_files([gtf], "GTF")
+    _check_nonempty_files([fasta], "FASTA")
+    if not atac and not rna:
+        raise FileNotFoundError(f"{mode} 模式至少需要一个 ATAC 或 RNA bigWig")
+    validate_bigwig_files((atac or []) + (rna or []), fasta_file=fasta)
+
+    for label, names, files in (
+        ("ATAC", atac_names, atac or []),
+        ("RNA", rna_names, rna or []),
+    ):
+        if names is not None and len(names) != len(files):
+            raise ValueError(
+                f"{label} 样本名数量 ({len(names)}) 与文件数量 ({len(files)}) 不一致"
+            )
+
+    if mode in {"profile", "paired"}:
+        if gene_file:
+            _check_nonempty_files([gene_file], "基因列表")
+        if not genes and not gene_file:
+            raise ValueError(f"{mode} 模式需要 --genes 或 --gene-file")
+    if mode == "paired":
+        if not metadata:
+            raise ValueError("paired 模式需要 --metadata")
+        _check_nonempty_files([metadata], "metadata")
 
 
 def main(argv=None):
@@ -350,6 +551,18 @@ def main(argv=None):
         return
 
     gtf, fasta, atac, rna = detect_inputs(args.work_dir, args.gtf, args.fasta, args.atac, args.rna)
+    _validate_analysis_inputs(
+        args.mode,
+        gtf,
+        fasta,
+        atac,
+        rna,
+        genes=genes,
+        gene_file=args.gene_file,
+        atac_names=atac_names,
+        rna_names=rna_names,
+        metadata=args.metadata,
+    )
 
     if args.mode == "catalog":
         run_catalog(
@@ -385,8 +598,6 @@ def main(argv=None):
             transcript_ids=transcript_ids,
         )
     elif args.mode == "paired":
-        if not args.metadata:
-            raise ValueError("paired mode requires --metadata")
         run_paired(
             gtf,
             fasta,
